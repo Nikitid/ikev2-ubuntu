@@ -2,15 +2,38 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "check:bash",
+      "label": "check:bash:syntax",
       "type": "shell",
-      "command": "find . -type f -name '*.sh' -print0 | xargs -0 bash -n && find . -type f -name '*.sh' -print0 | xargs -0 shellcheck",
+      "command": "find . -type f -name '*.sh' -print0 | xargs -0 bash -n",
+      "problemMatcher": []
+    },
+    {
+      "label": "check:bash:shellcheck",
+      "type": "shell",
+      "command": "if command -v shellcheck >/dev/null 2>&1; then find . -type f -name '*.sh' -print0 | xargs -0 shellcheck; else echo 'shellcheck is not installed; skipping'; fi",
+      "problemMatcher": []
+    },
+    {
+      "label": "check:bash:format",
+      "type": "shell",
+      "command": "if command -v shfmt >/dev/null 2>&1; then find . -type f -name '*.sh' -print0 | xargs -0 shfmt -d; else echo 'shfmt is not installed; skipping'; fi",
       "problemMatcher": []
     },
     {
       "label": "format:bash",
       "type": "shell",
+      "detail": "Writes formatting changes with shfmt -w. Use only when you intend to modify shell files.",
       "command": "find . -type f -name '*.sh' -print0 | xargs -0 shfmt -w",
+      "problemMatcher": []
+    },
+    {
+      "label": "check:bash:all",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "check:bash:syntax",
+        "check:bash:shellcheck",
+        "check:bash:format"
+      ],
       "problemMatcher": []
     },
     {

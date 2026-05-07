@@ -1,3 +1,1 @@
-# Project
-
-Draft Bash project.
+# ikev2-manager
