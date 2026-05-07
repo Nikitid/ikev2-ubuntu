@@ -441,6 +441,10 @@ render_header() {
   status_line "Service status:" "$service_status"
   status_line "Domain:" "${DOMAIN:-unset}"
   status_line "VPN users:" "$users_state"
+  status_line "Certificate:" "$cert_state"
+  status_line "Firewall:" "$firewall_state"
+  status_line "Auth:" "$auth_state"
+  status_line "Pool / DNS:" "$quick_state"
   status_line "MTProxy:" "$(mt_service_status)"
   status_line "3x-ui:" "$(xui_status)"
   echo
@@ -668,7 +672,7 @@ cleanup_acme_binding() {
   if [[ -n "${DOMAIN:-}" && -x "$ACME_BIN" ]]; then
     "$ACME_BIN" --remove -d "$DOMAIN" >/dev/null 2>&1 || true
     "$ACME_BIN" --remove -d "$DOMAIN" --ecc >/dev/null 2>&1 || true
-    rm -rf "$ACME_HOME/$DOMAIN" "$ACME_HOME/${DOMAIN}_ecc"
+    rm -rf -- "${ACME_HOME:?}/${DOMAIN:?}" "${ACME_HOME:?}/${DOMAIN:?}_ecc"
   fi
   rm -f "$ACME_ENV_FILE"
 }
@@ -805,8 +809,8 @@ secrets {
 EOF_HEAD
 
     if [[ -f "$USERS_DB" ]]; then
-      local db_user db_pass db_group db_platform db_rest esc_user esc_pass
-      while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+      local db_user db_pass db_group db_platform _db_rest esc_user esc_pass
+      while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
         [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
         esc_user=$(escape_swanctl "$db_user")
         esc_pass=$(escape_swanctl "$db_pass")
@@ -1065,7 +1069,7 @@ ensure_users_db() {
 
 migrate_users_db() {
   [[ -f "$USERS_DB" ]] || return 0
-  local tmp line db_user db_pass db_group db_platform db_rest
+  local tmp line db_user db_pass db_group db_platform _db_rest
   tmp=$(mktemp)
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "${line// }" ]] && continue
@@ -1073,9 +1077,9 @@ migrate_users_db() {
       continue
     fi
     if [[ "$line" == *'|'* ]]; then
-      IFS='|' read -r db_user db_pass db_group db_platform db_rest <<< "$line"
+      IFS='|' read -r db_user db_pass db_group db_platform _db_rest <<< "$line"
     else
-      IFS=$'\t' read -r db_user db_pass db_rest <<< "$line"
+      IFS=$'\t' read -r db_user db_pass _db_rest <<< "$line"
       db_group="$(infer_group_from_username "$db_user")"
       db_platform="unknown"
     fi
@@ -1093,7 +1097,7 @@ migrate_users_db() {
 add_or_update_user() {
   render_header
   ensure_users_db
-  local username password group platform choice tmpfile found=0 db_user db_pass db_group db_platform db_rest
+  local username password group platform choice tmpfile found=0 db_user db_pass db_group db_platform _db_rest
 
   username=$(ask "Username")
   if ! valid_username "$username"; then
@@ -1130,7 +1134,7 @@ add_or_update_user() {
   fi
 
   tmpfile=$(mktemp)
-  while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+  while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
     [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
     if [[ "$db_user" == "$username" ]]; then
       printf '%s|%s|%s|%s\n' "$username" "$password" "$group" "$platform" >> "$tmpfile"
@@ -1184,8 +1188,8 @@ list_users_menu() {
   echo "--------------------"
   printf '%-3s %-24s %-16s %-10s
 ' "#" "Username" "Group" "Platform"
-  local idx=1 db_user db_pass db_group db_platform db_rest
-  while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+  local idx=1 db_user db_pass db_group db_platform _db_rest
+  while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
     [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
     printf '%-3s %-24s %-16s %-10s
 ' "$idx)" "$db_user" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}"
@@ -1204,8 +1208,8 @@ remove_user_menu() {
   fi
 
   local -a users=()
-  local db_user db_pass db_group db_platform db_rest idx choice tmpfile
-  while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+  local db_user db_pass db_group db_platform _db_rest idx choice tmpfile
+  while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
     [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
     users+=("$db_user")
   done < "$USERS_DB"
@@ -1230,7 +1234,7 @@ remove_user_menu() {
   fi
 
   tmpfile=$(mktemp)
-  while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+  while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
     [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
     if [[ "$db_user" != "${users[$((choice - 1))]}" ]]; then
       printf '%s|%s|%s|%s
@@ -1262,8 +1266,8 @@ remove_user_menu() {
 get_group_users() {
   local group="$1" platform_filter="${2:-}"
   ensure_users_db
-  local db_user db_pass db_group db_platform db_rest
-  while IFS='|' read -r db_user db_pass db_group db_platform db_rest; do
+  local db_user db_pass db_group db_platform _db_rest
+  while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
     [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
     db_group="${db_group:-$(infer_group_from_username "$db_user")}"
     db_platform="${db_platform:-unknown}"
@@ -1405,8 +1409,8 @@ EOF_UBUNTU
 }
 
 credentials_html_for_platform() {
-  local group="$1" platform="$2" u p g pl
-  while IFS='|' read -r u p g pl; do
+  local group="$1" platform="$2" u p _g _pl
+  while IFS='|' read -r u p _g _pl; do
     [[ -z "$u" ]] && continue
     printf '<code>%s</code> — <code>%s</code>\n' "$(html_escape "$u")" "$(html_escape "$p")"
   done < <(get_group_users "$group" "$platform")
@@ -1504,7 +1508,7 @@ generate_client_bundle_local() {
     return 1
   fi
 
-  local ts bundle_dir user pass g platform file safe_user
+  local ts bundle_dir user _pass _g _platform file safe_user
   ts=$(date +%Y%m%d-%H%M%S)
   bundle_dir="$EXPORTS_DIR/${DOMAIN}_${group}_${ts}"
   mkdir -p "$bundle_dir/windows" "$bundle_dir/ios" "$bundle_dir/macos" "$bundle_dir/ubuntu"
@@ -1512,27 +1516,27 @@ generate_client_bundle_local() {
   if [[ -n "$(get_group_users "$group" "windows")" ]]; then
     windows_message_file "$group" "$bundle_dir/windows/windows-guide.html"
     cat > "$bundle_dir/windows/windows-apply.ps1" <<EOF_WINPS
-Add-VpnConnection -Name "${DOMAIN}" `
-  -ServerAddress "${DOMAIN}" `
-  -TunnelType IKEv2 `
-  -EncryptionLevel Maximum `
-  -AuthenticationMethod EAP `
+Add-VpnConnection -Name "${DOMAIN}" \`
+  -ServerAddress "${DOMAIN}" \`
+  -TunnelType IKEv2 \`
+  -EncryptionLevel Maximum \`
+  -AuthenticationMethod EAP \`
   -RememberCredential
 
-Set-VpnConnectionIPsecConfiguration -ConnectionName "${DOMAIN}" `
-  -AuthenticationTransformConstants GCMAES256 `
-  -CipherTransformConstants GCMAES256 `
-  -EncryptionMethod GCMAES256 `
-  -IntegrityCheckMethod SHA384 `
-  -DHGroup ECP384 `
-  -PfsGroup ECP384 `
+Set-VpnConnectionIPsecConfiguration -ConnectionName "${DOMAIN}" \`
+  -AuthenticationTransformConstants GCMAES256 \`
+  -CipherTransformConstants GCMAES256 \`
+  -EncryptionMethod GCMAES256 \`
+  -IntegrityCheckMethod SHA384 \`
+  -DHGroup ECP384 \`
+  -PfsGroup ECP384 \`
   -Force
 EOF_WINPS
   fi
 
   if [[ -n "$(get_group_users "$group" "ios")" ]]; then
     ios_message_file "$group" "ios" "VPN настройка для IPhone" "$bundle_dir/ios/ios-guide.html"
-    while IFS='|' read -r user pass g platform; do
+    while IFS='|' read -r user _pass _g _platform; do
       [[ -z "$user" ]] && continue
       safe_user="${user//[^A-Za-z0-9._@-]/_}"
       file="$bundle_dir/ios/${DOMAIN}-${safe_user}.mobileconfig"
@@ -1542,7 +1546,7 @@ EOF_WINPS
 
   if [[ -n "$(get_group_users "$group" "macos")" ]]; then
     ios_message_file "$group" "macos" "VPN настройка для macOS" "$bundle_dir/macos/macos-guide.html"
-    while IFS='|' read -r user pass g platform; do
+    while IFS='|' read -r user _pass _g _platform; do
       [[ -z "$user" ]] && continue
       safe_user="${user//[^A-Za-z0-9._@-]/_}"
       file="$bundle_dir/macos/${DOMAIN}-${safe_user}.mobileconfig"
