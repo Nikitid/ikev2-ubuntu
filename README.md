@@ -1,0 +1,3 @@
+# Project
+
+Draft Bash project.
