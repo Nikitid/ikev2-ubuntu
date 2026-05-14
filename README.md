@@ -1,7 +1,7 @@
 # IKEv2 Manager
 
-[![Build status](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager-dev/check.yml?branch=main&label=Build)](https://github.com/Nikitid/ikev2-manager-dev/actions/workflows/check.yml)
-[![ShellCheck](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager-dev/check.yml?branch=main&label=ShellCheck)](https://github.com/Nikitid/ikev2-manager-dev/actions/workflows/check.yml)
+[![Build status](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=Build)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
+[![ShellCheck](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=ShellCheck)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
 
 Interactive Bash manager for deploying and maintaining an IKEv2 VPN server on **Ubuntu 22.04 / 24.04**.
 
