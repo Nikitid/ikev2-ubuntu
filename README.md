@@ -1,5 +1,6 @@
 # IKEv2 Manager
 
+![License](https://img.shields.io/github/license/Nikitid/ikev2-manager)
 [![Build status](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=Build)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
 [![ShellCheck](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=ShellCheck)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
 
