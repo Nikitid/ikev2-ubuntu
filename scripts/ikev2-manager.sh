@@ -96,14 +96,13 @@ load_config() {
   INSTALLED="${INSTALLED:-0}"
 }
 
-
 effective_installed() {
   [[ "${INSTALLED:-0}" == "1" && -f "$CONFIG_FILE" && -f "$SWANCTL_CONF" ]]
 }
 
 save_config() {
   mkdir -p "$MANAGER_DIR"
-  cat > "$CONFIG_FILE" <<EOF_CFG
+  cat >"$CONFIG_FILE" <<EOF_CFG
 INSTALLED=${INSTALLED}
 DOMAIN='${DOMAIN}'
 ACME_EMAIL='${ACME_EMAIL}'
@@ -195,18 +194,17 @@ normalize_dns_list() {
       fi
     done
     break
-  done <<< "$input"
+  done <<<"$input"
   echo "$out"
 }
-
 
 valid_ipv4() {
   local ip="$1" IFS=.
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  read -r o1 o2 o3 o4 <<< "$ip"
+  read -r o1 o2 o3 o4 <<<"$ip"
   for oct in "$o1" "$o2" "$o3" "$o4"; do
     [[ "$oct" =~ ^[0-9]+$ ]] || return 1
-    (( oct >= 0 && oct <= 255 )) || return 1
+    ((oct >= 0 && oct <= 255)) || return 1
   done
 }
 
@@ -216,7 +214,7 @@ valid_cidr() {
   ip="${BASH_REMATCH[1]}"
   prefix="${BASH_REMATCH[2]}"
   valid_ipv4 "$ip" || return 1
-  (( prefix >= 0 && prefix <= 32 )) || return 1
+  ((prefix >= 0 && prefix <= 32)) || return 1
 }
 
 valid_range() {
@@ -229,11 +227,22 @@ valid_range() {
 }
 
 valid_domain_name() {
-  local d="$1"
+  local d="$1" label
+  local labels=()
+  local IFS='.'
+
   [[ -n "$d" ]] || return 1
+  [[ ${#d} -le 253 ]] || return 1
   [[ "$d" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
   [[ "$d" == *.* ]] || return 1
-  [[ "$d" != .* && "$d" != *..* && "$d" != *-.* && "$d" != *.-* && "$d" != -* && "$d" != *- ]] || return 1
+  [[ "$d" != .* && "$d" != *. ]] || return 1
+  [[ "$d" != *..* ]] || return 1
+
+  read -r -a labels <<<"$d"
+  for label in "${labels[@]}"; do
+    [[ ${#label} -ge 1 && ${#label} -le 63 ]] || return 1
+    [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+  done
 }
 
 valid_dns_provider() {
@@ -254,7 +263,7 @@ valid_group_name() {
 
 valid_platform() {
   case "$1" in
-    windows|ios|macos|ubuntu|unknown) return 0 ;;
+    windows | ios | macos | ubuntu | unknown) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -268,10 +277,10 @@ infer_group_from_username() {
 normalize_platform() {
   local p="${1,,}"
   case "$p" in
-    win|windows|pc) echo "windows" ;;
-    iphone|ios|ipad|phone) echo "ios" ;;
-    mac|macos) echo "macos" ;;
-    linux|ubuntu) echo "ubuntu" ;;
+    win | windows | pc) echo "windows" ;;
+    iphone | ios | ipad | phone) echo "ios" ;;
+    mac | macos) echo "macos" ;;
+    linux | ubuntu) echo "ubuntu" ;;
     "") echo "unknown" ;;
     *) echo "$p" ;;
   esac
@@ -305,13 +314,16 @@ detect_topology_hint() {
     return 0
   fi
   case "$ip" in
-    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) echo "private/NAT likely ($ip)" ;;
+    10.* | 192.168.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[0-1].*) echo "private/NAT likely ($ip)" ;;
     *) echo "public-ish ($ip)" ;;
   esac
 }
 
 count_users() {
-  [[ -f "$USERS_DB" ]] || { echo 0; return 0; }
+  [[ -f "$USERS_DB" ]] || {
+    echo 0
+    return 0
+  }
   awk -F'[|\t]' 'NF && $1 !~ /^[[:space:]]*$/ && $1 != "username" {c++} END{print c+0}' "$USERS_DB"
 }
 
@@ -327,7 +339,7 @@ cert_days_left() {
   [[ -n "$end_raw" ]] || return 1
   end_epoch=$(date -d "$end_raw" +%s 2>/dev/null) || return 1
   now_epoch=$(date +%s)
-  echo $(( (end_epoch - now_epoch) / 86400 ))
+  echo $(((end_epoch - now_epoch) / 86400))
 }
 
 has_nat_rule() {
@@ -474,7 +486,7 @@ ask_secret_multiline() {
   local line
   echo "$prompt"
   echo -e "${YELLOW}Enter KEY=VALUE lines. Empty line finishes input.${NC}"
-  : > "$ACME_ENV_FILE"
+  : >"$ACME_ENV_FILE"
   chmod 600 "$ACME_ENV_FILE"
   while true; do
     read -r -p "> " line || true
@@ -487,14 +499,14 @@ ask_secret_multiline() {
     key="${line%%=*}"
     value="${line#*=}"
     printf 'export %s=%q
-' "$key" "$value" >> "$ACME_ENV_FILE"
+' "$key" "$value" >>"$ACME_ENV_FILE"
   done
 }
 
 ask_secret_multiline_generic() {
   local line
   echo -e "${YELLOW}Enter KEY=VALUE lines. Empty line finishes input.${NC}"
-  : > "$ACME_ENV_FILE"
+  : >"$ACME_ENV_FILE"
   chmod 600 "$ACME_ENV_FILE"
   while true; do
     read -r -p "> " line || true
@@ -507,13 +519,13 @@ ask_secret_multiline_generic() {
     key="${line%%=*}"
     value="${line#*=}"
     printf 'export %s=%q
-' "$key" "$value" >> "$ACME_ENV_FILE"
+' "$key" "$value" >>"$ACME_ENV_FILE"
   done
 }
 
 ask_acme_provider_env() {
   mkdir -p "$MANAGER_DIR"
-  : > "$ACME_ENV_FILE"
+  : >"$ACME_ENV_FILE"
   chmod 600 "$ACME_ENV_FILE"
 
   case "$DNS_PROVIDER" in
@@ -524,7 +536,7 @@ ask_acme_provider_env() {
         [[ -n "$token" ]] && break
         echo "Token cannot be empty."
       done
-      printf 'export TW_Token=%q\n' "$token" > "$ACME_ENV_FILE"
+      printf 'export TW_Token=%q\n' "$token" >"$ACME_ENV_FILE"
       ;;
     "")
       return 0
@@ -574,7 +586,7 @@ ensure_acme_installed() {
 
 write_firewall_script() {
   mkdir -p "$MANAGER_DIR"
-  cat > "$FIREWALL_SCRIPT" <<EOF_FW
+  cat >"$FIREWALL_SCRIPT" <<EOF_FW
 #!/usr/bin/env bash
 set -Eeuo pipefail
 POOL_CIDR='${VPN_POOL_CIDR}'
@@ -603,7 +615,7 @@ EOF_FW
 }
 
 write_firewall_service() {
-  cat > "$FIREWALL_SERVICE" <<EOF_SVC
+  cat >"$FIREWALL_SERVICE" <<EOF_SVC
 [Unit]
 Description=IKEv2 Manager firewall rules
 After=network-online.target
@@ -622,7 +634,10 @@ EOF_SVC
 }
 
 apply_firewall_rules() {
-  [[ -n "$UPLINK_IF" ]] || { echo "Uplink interface is not set."; return 1; }
+  [[ -n "$UPLINK_IF" ]] || {
+    echo "Uplink interface is not set."
+    return 1
+  }
   write_firewall_script
   write_firewall_service
   "$FIREWALL_SCRIPT"
@@ -658,7 +673,7 @@ remove_firewall_rules() {
 
   if command -v iptables-save >/dev/null 2>&1; then
     mkdir -p /etc/iptables
-    iptables-save > /etc/iptables/rules.v4 || true
+    iptables-save >/etc/iptables/rules.v4 || true
   fi
 }
 
@@ -743,7 +758,7 @@ uninstall_cleanup() {
 }
 
 enable_sysctl() {
-  cat > "$SYSCTL_FILE" <<'EOF_SYSCTL'
+  cat >"$SYSCTL_FILE" <<'EOF_SYSCTL'
 net.ipv4.ip_forward=1
 EOF_SYSCTL
   sysctl --system >/dev/null
@@ -811,7 +826,7 @@ EOF_HEAD
     if [[ -f "$USERS_DB" ]]; then
       local db_user db_pass db_group db_platform _db_rest esc_user esc_pass
       while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-        [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+        [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
         esc_user=$(escape_swanctl "$db_user")
         esc_pass=$(escape_swanctl "$db_pass")
         cat <<EOF_USER
@@ -821,7 +836,7 @@ EOF_HEAD
   }
 
 EOF_USER
-      done < "$USERS_DB"
+      done <"$USERS_DB"
     fi
 
     cat <<EOF_TAIL
@@ -830,7 +845,7 @@ EOF_USER
   }
 }
 EOF_TAIL
-  } > "$SWANCTL_CONF"
+  } >"$SWANCTL_CONF"
   chmod 600 "$SWANCTL_CONF"
 }
 
@@ -841,7 +856,10 @@ load_swanctl() {
 }
 
 issue_and_install_cert() {
-  [[ -n "${DOMAIN:-}" ]] || { echo "Domain is not set."; return 1; }
+  [[ -n "${DOMAIN:-}" ]] || {
+    echo "Domain is not set."
+    return 1
+  }
 
   mkdir -p /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
   backup_file "$CERT_PATH"
@@ -852,8 +870,14 @@ issue_and_install_cert() {
 
   case "${ACME_MODE:-dns-01}" in
     dns-01)
-      [[ -n "${DNS_PROVIDER:-}" ]] || { echo "DNS provider is not set."; return 1; }
-      [[ -f "$ACME_ENV_FILE" ]] || { echo "ACME env file is missing: $ACME_ENV_FILE"; return 1; }
+      [[ -n "${DNS_PROVIDER:-}" ]] || {
+        echo "DNS provider is not set."
+        return 1
+      }
+      [[ -f "$ACME_ENV_FILE" ]] || {
+        echo "ACME env file is missing: $ACME_ENV_FILE"
+        return 1
+      }
       # shellcheck disable=SC1090
       source "$ACME_ENV_FILE"
       "$ACME_BIN" --issue -d "$DOMAIN" --dns "$DNS_PROVIDER" --keylength 2048
@@ -878,12 +902,18 @@ issue_and_install_cert() {
 validate_acme_env() {
   case "${ACME_MODE:-dns-01}" in
     dns-01)
-      [[ -f "$ACME_ENV_FILE" ]] || { echo "ACME env file is missing."; return 1; }
+      [[ -f "$ACME_ENV_FILE" ]] || {
+        echo "ACME env file is missing."
+        return 1
+      }
       # shellcheck disable=SC1090
       source "$ACME_ENV_FILE"
       case "$DNS_PROVIDER" in
         dns_timeweb)
-          [[ -n "${TW_Token:-}" ]] || { echo "TW_Token is missing for dns_timeweb."; return 1; }
+          [[ -n "${TW_Token:-}" ]] || {
+            echo "TW_Token is missing for dns_timeweb."
+            return 1
+          }
           ;;
       esac
       ;;
@@ -899,30 +929,66 @@ validate_acme_env() {
 
 validate_install_inputs() {
   DOMAIN="${DOMAIN,,}"
-  [[ -n "$DOMAIN" ]] || { echo "Domain is required."; return 1; }
-  valid_domain_name "$DOMAIN" || { echo "Domain must contain only ASCII letters, digits, dots and hyphens."; return 1; }
+  [[ -n "$DOMAIN" ]] || {
+    echo "Domain is required."
+    return 1
+  }
+  valid_domain_name "$DOMAIN" || {
+    echo "Domain must contain only ASCII letters, digits, dots and hyphens."
+    return 1
+  }
 
   ACME_MODE="${ACME_MODE,,}"
-  [[ "$ACME_MODE" == "dns-01" || "$ACME_MODE" == "http-01" ]] || { echo "ACME mode must be dns-01 or http-01."; return 1; }
+  [[ "$ACME_MODE" == "dns-01" || "$ACME_MODE" == "http-01" ]] || {
+    echo "ACME mode must be dns-01 or http-01."
+    return 1
+  }
 
   if [[ "$ACME_MODE" == "dns-01" ]]; then
-    [[ -n "$DNS_PROVIDER" ]] || { echo "DNS provider is required for DNS-01."; return 1; }
-    valid_dns_provider "$DNS_PROVIDER" || { echo "DNS provider contains invalid characters."; return 1; }
+    [[ -n "$DNS_PROVIDER" ]] || {
+      echo "DNS provider is required for DNS-01."
+      return 1
+    }
+    valid_dns_provider "$DNS_PROVIDER" || {
+      echo "DNS provider contains invalid characters."
+      return 1
+    }
   else
     DNS_PROVIDER=""
   fi
 
-  [[ -n "$UPLINK_IF" ]] || { echo "Uplink interface is required."; return 1; }
-  interface_exists "$UPLINK_IF" || { echo "Uplink interface does not exist: $UPLINK_IF"; return 1; }
+  [[ -n "$UPLINK_IF" ]] || {
+    echo "Uplink interface is required."
+    return 1
+  }
+  interface_exists "$UPLINK_IF" || {
+    echo "Uplink interface does not exist: $UPLINK_IF"
+    return 1
+  }
 
-  [[ -n "$VPN_POOL_CIDR" ]] || { echo "VPN pool CIDR is required."; return 1; }
-  valid_cidr "$VPN_POOL_CIDR" || { echo "VPN pool CIDR is invalid."; return 1; }
+  [[ -n "$VPN_POOL_CIDR" ]] || {
+    echo "VPN pool CIDR is required."
+    return 1
+  }
+  valid_cidr "$VPN_POOL_CIDR" || {
+    echo "VPN pool CIDR is invalid."
+    return 1
+  }
 
-  [[ -n "$VPN_POOL_RANGE" ]] || { echo "VPN pool range is required."; return 1; }
-  valid_range "$VPN_POOL_RANGE" || { echo "VPN pool range is invalid. Use start-end."; return 1; }
+  [[ -n "$VPN_POOL_RANGE" ]] || {
+    echo "VPN pool range is required."
+    return 1
+  }
+  valid_range "$VPN_POOL_RANGE" || {
+    echo "VPN pool range is invalid. Use start-end."
+    return 1
+  }
 
   VPN_DNS=$(normalize_dns_list "$VPN_DNS")
-  [[ -n "$VPN_DNS" ]] || { echo "VPN DNS is invalid. Use IPv4 addresses separated by commas."; return 1; }
+  [[ -n "$VPN_DNS" ]] || {
+    echo "VPN DNS is invalid. Use IPv4 addresses separated by commas."
+    return 1
+  }
 }
 install_wizard() {
   render_header
@@ -1072,23 +1138,23 @@ migrate_users_db() {
   local tmp line db_user db_pass db_group db_platform _db_rest
   tmp=$(mktemp)
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "${line// }" ]] && continue
+    [[ -z "${line// /}" ]] && continue
     if [[ "$line" == username\|password\|group\|platform ]]; then
       continue
     fi
     if [[ "$line" == *'|'* ]]; then
-      IFS='|' read -r db_user db_pass db_group db_platform _db_rest <<< "$line"
+      IFS='|' read -r db_user db_pass db_group db_platform _db_rest <<<"$line"
     else
-      IFS=$'\t' read -r db_user db_pass _db_rest <<< "$line"
+      IFS=$'\t' read -r db_user db_pass _db_rest <<<"$line"
       db_group="$(infer_group_from_username "$db_user")"
       db_platform="unknown"
     fi
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     db_group="${db_group:-$(infer_group_from_username "$db_user")}"
     db_platform="$(normalize_platform "${db_platform:-unknown}")"
     valid_platform "$db_platform" || db_platform="unknown"
-    printf '%s|%s|%s|%s\n' "$db_user" "$db_pass" "$db_group" "$db_platform" >> "$tmp"
-  done < "$USERS_DB"
+    printf '%s|%s|%s|%s\n' "$db_user" "$db_pass" "$db_group" "$db_platform" >>"$tmp"
+  done <"$USERS_DB"
   mv "$tmp" "$USERS_DB"
   chmod 600 "$USERS_DB"
   return 0
@@ -1135,16 +1201,16 @@ add_or_update_user() {
 
   tmpfile=$(mktemp)
   while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     if [[ "$db_user" == "$username" ]]; then
-      printf '%s|%s|%s|%s\n' "$username" "$password" "$group" "$platform" >> "$tmpfile"
+      printf '%s|%s|%s|%s\n' "$username" "$password" "$group" "$platform" >>"$tmpfile"
       found=1
     else
-      printf '%s|%s|%s|%s\n' "$db_user" "$db_pass" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}" >> "$tmpfile"
+      printf '%s|%s|%s|%s\n' "$db_user" "$db_pass" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}" >>"$tmpfile"
     fi
-  done < "$USERS_DB"
+  done <"$USERS_DB"
   if [[ "$found" -eq 0 ]]; then
-    printf '%s|%s|%s|%s\n' "$username" "$password" "$group" "$platform" >> "$tmpfile"
+    printf '%s|%s|%s|%s\n' "$username" "$password" "$group" "$platform" >>"$tmpfile"
   fi
   mv "$tmpfile" "$USERS_DB"
   chmod 600 "$USERS_DB"
@@ -1190,11 +1256,11 @@ list_users_menu() {
 ' "#" "Username" "Group" "Platform"
   local idx=1 db_user db_pass db_group db_platform _db_rest
   while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     printf '%-3s %-24s %-16s %-10s
 ' "$idx)" "$db_user" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}"
     idx=$((idx + 1))
-  done < "$USERS_DB"
+  done <"$USERS_DB"
   pause
 }
 
@@ -1210,9 +1276,9 @@ remove_user_menu() {
   local -a users=()
   local db_user db_pass db_group db_platform _db_rest idx choice tmpfile
   while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     users+=("$db_user")
-  done < "$USERS_DB"
+  done <"$USERS_DB"
 
   echo "Choose user to remove"
   echo "---------------------"
@@ -1227,7 +1293,7 @@ remove_user_menu() {
   if [[ "$choice" == "0" || -z "$choice" ]]; then
     return 0
   fi
-  if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#users[@]} )); then
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || ((choice < 1 || choice > ${#users[@]})); then
     echo "Invalid selection."
     pause
     return 1
@@ -1235,12 +1301,12 @@ remove_user_menu() {
 
   tmpfile=$(mktemp)
   while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     if [[ "$db_user" != "${users[$((choice - 1))]}" ]]; then
       printf '%s|%s|%s|%s
-' "$db_user" "$db_pass" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}" >> "$tmpfile"
+' "$db_user" "$db_pass" "${db_group:-$(infer_group_from_username "$db_user")}" "${db_platform:-unknown}" >>"$tmpfile"
     fi
-  done < "$USERS_DB"
+  done <"$USERS_DB"
   mv "$tmpfile" "$USERS_DB"
   chmod 600 "$USERS_DB"
 
@@ -1262,19 +1328,18 @@ remove_user_menu() {
   pause
 }
 
-
 get_group_users() {
   local group="$1" platform_filter="${2:-}"
   ensure_users_db
   local db_user db_pass db_group db_platform _db_rest
   while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
-    [[ -z "${db_user// }" || "$db_user" == "username" ]] && continue
+    [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
     db_group="${db_group:-$(infer_group_from_username "$db_user")}"
     db_platform="${db_platform:-unknown}"
-    if [[ "$db_group" == "$group" && ( -z "$platform_filter" || "$db_platform" == "$platform_filter" ) ]]; then
+    if [[ "$db_group" == "$group" && (-z "$platform_filter" || "$db_platform" == "$platform_filter") ]]; then
       printf '%s|%s|%s|%s\n' "$db_user" "$db_pass" "$db_group" "$db_platform"
     fi
-  done < "$USERS_DB"
+  done <"$USERS_DB"
 }
 
 list_groups() {
@@ -1291,7 +1356,7 @@ select_group_prompt() {
     [[ -n "$line" ]] && groups+=("$line")
   done < <(list_groups)
 
-  if (( ${#groups[@]} == 0 )); then
+  if ((${#groups[@]} == 0)); then
     echo "No groups found."
     return 1
   fi
@@ -1308,7 +1373,7 @@ select_group_prompt() {
   input="$(trim "$input")"
 
   if [[ "$input" =~ ^[0-9]+$ ]]; then
-    if (( input >= 1 && input <= ${#groups[@]} )); then
+    if ((input >= 1 && input <= ${#groups[@]})); then
       printf '%s\n' "${groups[$((input - 1))]}"
       return 0
     fi
@@ -1335,10 +1400,11 @@ select_group_prompt() {
 make_ios_mobileconfig() {
   local host="$1" display_name="$2" out_file="$3"
   local uuid_root uuid_vpn payload_id root_id
-  uuid_root=$(uuid); uuid_vpn=$(uuid)
+  uuid_root=$(uuid)
+  uuid_vpn=$(uuid)
   payload_id="com.nikitid.ikev2.$(date +%s).$(openssl rand -hex 4)"
   root_id="com.nikitid.ikev2.root.$(date +%s).$(openssl rand -hex 4)"
-  cat > "$out_file" <<EOF_PROFILE
+  cat >"$out_file" <<EOF_PROFILE
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1379,7 +1445,7 @@ EOF_PROFILE
 
 make_ubuntu_script() {
   local host="$1" out_file="$2"
-  cat > "$out_file" <<EOF_UBUNTU
+  cat >"$out_file" <<EOF_UBUNTU
 #!/usr/bin/env bash
 set -euo pipefail
 read -r -p "Username: " VPN_USER
@@ -1434,7 +1500,7 @@ windows_message_file() {
   -PfsGroup ECP384 \`
   -Force"
   creds=$(credentials_html_for_platform "$group" "windows")
-  cat > "$out_file" <<EOF_WIN
+  cat >"$out_file" <<EOF_WIN
 <b>VPN настройка для ПК</b>
 1) В PowerShell нужно вставить два абзаца (раздельно два абзаца).
 
@@ -1453,7 +1519,7 @@ EOF_WIN
 ios_message_file() {
   local group="$1" platform="$2" title="$3" out_file="$4" creds
   creds=$(credentials_html_for_platform "$group" "$platform")
-  cat > "$out_file" <<EOF_IOS
+  cat >"$out_file" <<EOF_IOS
 <b>${title}</b>
 1) Качаем файл ниже
 2) Сохраняем где угодно, например в загрузках
@@ -1470,7 +1536,7 @@ EOF_IOS
 ubuntu_message_file() {
   local group="$1" out_file="$2" creds
   creds=$(credentials_html_for_platform "$group" "ubuntu")
-  cat > "$out_file" <<EOF_UBMSG
+  cat >"$out_file" <<EOF_UBMSG
 <b>VPN настройка для Ubuntu</b>
 1) Скачай файл ниже
 2) Выполни: <code>chmod +x *.sh</code>
@@ -1515,7 +1581,7 @@ generate_client_bundle_local() {
 
   if [[ -n "$(get_group_users "$group" "windows")" ]]; then
     windows_message_file "$group" "$bundle_dir/windows/windows-guide.html"
-    cat > "$bundle_dir/windows/windows-apply.ps1" <<EOF_WINPS
+    cat >"$bundle_dir/windows/windows-apply.ps1" <<EOF_WINPS
 Add-VpnConnection -Name "${DOMAIN}" \`
   -ServerAddress "${DOMAIN}" \`
   -TunnelType IKEv2 \`
@@ -1614,13 +1680,13 @@ mt_load_config() {
   fi
 
   if [[ -f "$MT_SECRET_FILE" ]]; then
-    MT_SECRET="$(tr -d '\r\n' < "$MT_SECRET_FILE")"
+    MT_SECRET="$(tr -d '\r\n' <"$MT_SECRET_FILE")"
   fi
 }
 
 mt_save_config() {
   mt_init_dirs
-  cat > "$MT_CONFIG_FILE" <<EOF_MTCONF
+  cat >"$MT_CONFIG_FILE" <<EOF_MTCONF
 MT_PORT="$MT_PORT"
 MT_INTERNAL_PORT="$MT_INTERNAL_PORT"
 MT_TLS_DOMAIN="$MT_TLS_DOMAIN"
@@ -1706,7 +1772,7 @@ mt_check_tls_domain() {
 mt_validate_port() {
   local port="$1"
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  (( port >= 1 && port <= 65535 )) || return 1
+  ((port >= 1 && port <= 65535)) || return 1
   return 0
 }
 
@@ -1724,7 +1790,7 @@ mt_check_required_commands() {
     fi
   done
 
-  if (( ${#missing[@]} > 0 )); then
+  if ((${#missing[@]} > 0)); then
     echo -e "${RED}Missing required commands:${NC} ${missing[*]}"
     return 1
   fi
@@ -1738,8 +1804,8 @@ mt_configure_pid_max() {
     return 0
   fi
 
-  if (( current > MT_PID_MAX_LIMIT )); then
-    printf 'kernel.pid_max=%s\n' "$MT_PID_MAX_LIMIT" > "$MT_SYSCTL_FILE"
+  if ((current > MT_PID_MAX_LIMIT)); then
+    printf 'kernel.pid_max=%s\n' "$MT_PID_MAX_LIMIT" >"$MT_SYSCTL_FILE"
     sysctl -q -p "$MT_SYSCTL_FILE" || true
   fi
 }
@@ -1748,7 +1814,7 @@ mt_show_pid_max_warning_if_needed() {
   local current
   current="$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 0)"
 
-  if [[ "$current" =~ ^[0-9]+$ ]] && (( current > MT_PID_MAX_LIMIT )); then
+  if [[ "$current" =~ ^[0-9]+$ ]] && ((current > MT_PID_MAX_LIMIT)); then
     echo -e "${YELLOW}Warning:${NC} kernel.pid_max=${current}. MTProxy may crash with PID > ${MT_PID_MAX_LIMIT}."
     echo -e "${YELLOW}Recommended fix:${NC} set kernel.pid_max=${MT_PID_MAX_LIMIT}"
     echo
@@ -1756,7 +1822,7 @@ mt_show_pid_max_warning_if_needed() {
 }
 
 mt_write_service() {
-  cat > "$MT_SERVICE_FILE" <<EOF_MTSVC
+  cat >"$MT_SERVICE_FILE" <<EOF_MTSVC
 [Unit]
 Description=MTProto Proxy
 Wants=network-online.target
@@ -1822,13 +1888,13 @@ mt_service_is_running() {
 mt_verify_service_started() {
   local attempts=15 stable=0 active_state sub_state
 
-  while (( attempts > 0 )); do
+  while ((attempts > 0)); do
     active_state="$(systemctl show -p ActiveState --value "${MT_SERVICE}.service" 2>/dev/null || true)"
     sub_state="$(systemctl show -p SubState --value "${MT_SERVICE}.service" 2>/dev/null || true)"
 
     if [[ "$active_state" == "active" && "$sub_state" == "running" ]]; then
       ((stable++))
-      if (( stable >= 3 )); then
+      if ((stable >= 3)); then
         return 0
       fi
     elif [[ "$active_state" == "failed" || "$sub_state" == "failed" ]]; then
@@ -1898,6 +1964,11 @@ mt_prompt_install_settings() {
     return 1
   fi
 
+  if ! valid_domain_name "$MT_TLS_DOMAIN"; then
+    echo -e "${RED}Invalid TLS domain${NC}"
+    return 1
+  fi
+
   if mt_port_in_use "$MT_PORT" && ! mt_is_installed; then
     echo -e "${RED}Client port ${MT_PORT} is already in use${NC}"
     return 1
@@ -1929,10 +2000,16 @@ mt_install() {
   echo
 
   mt_load_config
-  mt_prompt_install_settings || { sleep 2; return 1; }
+  mt_prompt_install_settings || {
+    sleep 2
+    return 1
+  }
 
   mt_install_packages
-  mt_check_required_commands || { sleep 2; return 1; }
+  mt_check_required_commands || {
+    sleep 2
+    return 1
+  }
   mt_configure_pid_max
 
   rm -rf "$MT_INSTALL_DIR"
@@ -1950,7 +2027,7 @@ mt_install() {
 
   mt_init_dirs
   MT_SECRET="$(mt_generate_secret)"
-  printf '%s\n' "$MT_SECRET" > "$MT_SECRET_FILE"
+  printf '%s\n' "$MT_SECRET" >"$MT_SECRET_FILE"
   chmod 600 "$MT_SECRET_FILE"
 
   mt_save_config
@@ -1997,7 +2074,10 @@ mt_remove() {
 mt_restart_or_start_service() {
   render_header
   mt_require_installed || return 1
-  mt_check_required_commands || { sleep 2; return 1; }
+  mt_check_required_commands || {
+    sleep 2
+    return 1
+  }
   mt_configure_pid_max
 
   if mt_service_is_running; then
@@ -2030,7 +2110,10 @@ mt_stop() {
 mt_update() {
   render_header
   mt_require_installed || return 1
-  mt_check_required_commands || { sleep 2; return 1; }
+  mt_check_required_commands || {
+    sleep 2
+    return 1
+  }
   mt_load_config
   mt_configure_pid_max
 
@@ -2080,7 +2163,7 @@ mt_change_secret() {
       fi
       MT_SECRET="${MT_SECRET,,}"
       ;;
-    ""|0)
+    "" | 0)
       return 0
       ;;
     *)
@@ -2089,7 +2172,7 @@ mt_change_secret() {
       ;;
   esac
 
-  printf '%s\n' "$MT_SECRET" > "$MT_SECRET_FILE"
+  printf '%s\n' "$MT_SECRET" >"$MT_SECRET_FILE"
   chmod 600 "$MT_SECRET_FILE"
 
   mt_write_service
@@ -2111,6 +2194,12 @@ mt_change_tls_domain() {
 
   read -r -p "Enter TLS domain [${MT_TLS_DOMAIN}]: " new_domain
   new_domain="${new_domain:-$MT_TLS_DOMAIN}"
+
+  if ! valid_domain_name "$new_domain"; then
+    echo -e "${RED}Invalid TLS domain${NC}"
+    sleep 2
+    return 1
+  fi
 
   echo -e "${WHITE}Checking TLS domain...${NC}"
   if mt_check_tls_domain "$new_domain"; then
@@ -2254,7 +2343,7 @@ mtproxy_menu() {
           7) mt_show_active_ips ;;
           8) mt_show_status_link ;;
           9) mt_show_logs ;;
-          ""|0) return 0 ;;
+          "" | 0) return 0 ;;
           *) invalid_choice ;;
         esac
       else
@@ -2280,7 +2369,7 @@ mtproxy_menu() {
           6) mt_show_active_ips ;;
           7) mt_show_status_link ;;
           8) mt_show_logs ;;
-          ""|0) return 0 ;;
+          "" | 0) return 0 ;;
           *) invalid_choice ;;
         esac
       fi
@@ -2293,7 +2382,7 @@ mtproxy_menu() {
 
       case "$choice" in
         1) mt_install ;;
-        ""|0) return 0 ;;
+        "" | 0) return 0 ;;
         *) invalid_choice ;;
       esac
     fi
@@ -2303,7 +2392,10 @@ mtproxy_menu() {
 # ------------------------- 3x-ui manager -------------------------
 xui_is_installed() { command -v x-ui >/dev/null 2>&1 || [[ -x "$XUI_DIR/x-ui" || -f /etc/systemd/system/x-ui.service || -f /usr/lib/systemd/system/x-ui.service ]]; }
 xui_status() {
-  if ! xui_is_installed; then echo "not-installed"; return 0; fi
+  if ! xui_is_installed; then
+    echo "not-installed"
+    return 0
+  fi
   local a s
   a=$(systemctl show -p ActiveState --value "${XUI_SERVICE}.service" 2>/dev/null || true)
   s=$(systemctl show -p SubState --value "${XUI_SERVICE}.service" 2>/dev/null || true)
@@ -2371,7 +2463,7 @@ xui_menu() {
       read_menu_choice choice
       case "$choice" in
         1) xui_install ;;
-        ""|0) return 0 ;;
+        "" | 0) return 0 ;;
         *) invalid_choice ;;
       esac
     else
@@ -2386,7 +2478,7 @@ xui_menu() {
         1) xui_info ;;
         2) xui_restart ;;
         3) xui_install ;;
-        ""|0) return 0 ;;
+        "" | 0) return 0 ;;
         *) invalid_choice ;;
       esac
     fi
@@ -2559,7 +2651,7 @@ vpn_users_menu() {
       2) list_users_menu ;;
       3) remove_user_menu ;;
       4) generate_client_bundle_local ;;
-      ""|0) return 0 ;;
+      "" | 0) return 0 ;;
       *) invalid_choice ;;
     esac
   done
@@ -2588,7 +2680,7 @@ service_tools_menu() {
       4) show_recent_logs ;;
       5) show_client_info ;;
       6) uninstall_cleanup ;;
-      ""|0) return 0 ;;
+      "" | 0) return 0 ;;
       *) invalid_choice ;;
     esac
   done
@@ -2617,7 +2709,7 @@ main_menu_not_installed() {
       2) mtproxy_menu ;;
       3) xui_menu ;;
       4) show_diagnostics ;;
-      ""|0) exit 0 ;;
+      "" | 0) exit 0 ;;
       *) invalid_choice ;;
     esac
   done
@@ -2655,7 +2747,7 @@ main_menu_installed() {
         5) mtproxy_menu ;;
         6) xui_menu ;;
         7) service_tools_menu ;;
-        ""|0) exit 0 ;;
+        "" | 0) exit 0 ;;
         *) invalid_choice ;;
       esac
     else
@@ -2679,7 +2771,7 @@ main_menu_installed() {
         4) mtproxy_menu ;;
         5) xui_menu ;;
         6) service_tools_menu ;;
-        ""|0) exit 0 ;;
+        "" | 0) exit 0 ;;
         *) invalid_choice ;;
       esac
     fi

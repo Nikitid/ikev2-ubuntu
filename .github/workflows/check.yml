@@ -1,0 +1,31 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    name: ShellCheck and shfmt
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Install shfmt
+        run: |
+          curl -fsSL -o shfmt https://github.com/mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64
+          chmod +x shfmt
+          sudo mv shfmt /usr/local/bin/shfmt
+
+      - name: Run ShellCheck
+        run: find . -type f -name '*.sh' -not -path './.git/*' -exec shellcheck {} +
+
+      - name: Check formatting with shfmt
+        run: find . -type f -name '*.sh' -not -path './.git/*' -exec shfmt -i 2 -bn -ci -d {} +
