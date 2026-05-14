@@ -37,13 +37,13 @@ The script focuses on a practical single-server setup: strongSwan with `swanctl`
 Run the latest version from `main`:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager-dev/main/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/scripts/ikev2-manager.sh)
 ```
 
 Run a tagged release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager-dev/v1.0.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.0/scripts/ikev2-manager.sh)
 ```
 
 ## Notes
