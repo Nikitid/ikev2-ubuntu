@@ -1,7 +1,59 @@
-# ikev2-manager
+# IKEv2 Manager
 
 [![Build status](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager-dev/check.yml?branch=main&label=Build)](https://github.com/Nikitid/ikev2-manager-dev/actions/workflows/check.yml)
 [![ShellCheck](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager-dev/check.yml?branch=main&label=ShellCheck)](https://github.com/Nikitid/ikev2-manager-dev/actions/workflows/check.yml)
+
+Interactive Bash manager for deploying and maintaining an IKEv2 VPN server on **Ubuntu 22.04 / 24.04**.
+
+The script focuses on a practical single-server setup: strongSwan with `swanctl`, ACME certificates, basic firewall/NAT rules, VPN user management, and local client configuration export. It also includes optional management menus for MTProxy and 3x-ui on the same host.
+
+## Features
+
+- Install and reconfigure an IKEv2 VPN server
+- Configure strongSwan / `swanctl`
+- Issue and install certificates through `acme.sh`
+- Support `dns-01` and `http-01` ACME validation modes
+- Manage VPN users with username, password, group, and platform labels
+- Export local client bundles for Windows, iOS, macOS, and Ubuntu
+- Configure IPv4 forwarding and iptables NAT rules
+- Reapply firewall rules and reissue certificates from the menu
+- Show service status, diagnostics, recent logs, and client info
+- Uninstall managed VPN files, firewall rules, ACME bindings, and strongSwan packages
+- Optional MTProxy installation and management
+- Optional 3x-ui installation and management through the official installer
+
+## Supported Systems
+
+- Ubuntu 22.04 LTS
+- Ubuntu 24.04 LTS
+- root access
+- systemd
+- iptables-based firewall management
+- public domain name for the VPN server
+
+## Quick Install
+
+Run the latest version from `main`:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager-dev/main/scripts/ikev2-manager.sh)
+```
+
+Run a tagged release:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager-dev/v1.0.0/scripts/ikev2-manager.sh)
+```
+
+## Notes
+
+- The script must be run as root.
+- For `http-01` certificate validation, TCP port `80` must be reachable from the internet.
+- For `dns-01`, you need an `acme.sh` DNS provider name and its required API credentials.
+- External cloud firewalls or security groups must allow UDP `500` and UDP `4500` for IKEv2.
+- The script writes managed state under `/opt/ikev2-manager`.
+- VPN configuration is generated at `/etc/swanctl/swanctl.conf`.
+- Firewall rules are applied through iptables and persisted when `iptables-save` is available.
 
 ## Development
 
