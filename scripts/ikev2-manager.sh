@@ -792,12 +792,19 @@ uninstall_cleanup() {
 ensure_kernel_ipsec_support() {
   local required_modules=(xfrm_user esp4)
   local optional_modules=(af_key ah4 xfrm4_tunnel rfc4106 gcm aes aesni_intel)
-  local module failed=0
+  local module failed=0 output
 
   if command -v modprobe >/dev/null 2>&1; then
     for module in "${required_modules[@]}"; do
-      if ! modprobe "$module" >/dev/null 2>&1; then
+      if ! output=$(modprobe "$module" 2>&1); then
         echo "Kernel module unavailable: $module"
+        if grep -qE "install command '.*/bin/false'|install /bin/false" <<<"$output"; then
+          echo "Module $module is blocked by a modprobe.d mitigation rule."
+          grep -RIn -- "install[[:space:]]\\+${module}\\|blacklist[[:space:]]\\+${module}" \
+            /etc/modprobe.d /usr/lib/modprobe.d /lib/modprobe.d 2>/dev/null || true
+        else
+          echo "$output"
+        fi
         failed=1
       fi
     done
