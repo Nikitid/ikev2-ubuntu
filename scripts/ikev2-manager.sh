@@ -102,26 +102,26 @@ effective_installed() {
 
 save_config() {
   mkdir -p "$MANAGER_DIR"
-  cat >"$CONFIG_FILE" <<EOF_CFG
-INSTALLED=${INSTALLED}
-DOMAIN='${DOMAIN}'
-ACME_EMAIL='${ACME_EMAIL}'
-ACME_MODE='${ACME_MODE}'
-DNS_PROVIDER='${DNS_PROVIDER}'
-CONN_NAME='${CONN_NAME}'
-CERT_NAME='${CERT_NAME}'
-CERT_PATH='${CERT_PATH}'
-CA_PATH='${CA_PATH}'
-KEY_PATH='${KEY_PATH}'
-VPN_POOL_RANGE='${VPN_POOL_RANGE}'
-VPN_POOL_CIDR='${VPN_POOL_CIDR}'
-VPN_DNS='${VPN_DNS}'
-UPLINK_IF='${UPLINK_IF}'
-DPD_DELAY='${DPD_DELAY}'
-IKE_PROPOSALS='${IKE_PROPOSALS}'
-ESP_PROPOSALS='${ESP_PROPOSALS}'
-LOCAL_TS='${LOCAL_TS}'
-EOF_CFG
+  {
+    printf 'INSTALLED=%q\n' "${INSTALLED:-0}"
+    printf 'DOMAIN=%q\n' "${DOMAIN:-}"
+    printf 'ACME_EMAIL=%q\n' "${ACME_EMAIL:-}"
+    printf 'ACME_MODE=%q\n' "${ACME_MODE:-}"
+    printf 'DNS_PROVIDER=%q\n' "${DNS_PROVIDER:-}"
+    printf 'CONN_NAME=%q\n' "${CONN_NAME:-}"
+    printf 'CERT_NAME=%q\n' "${CERT_NAME:-}"
+    printf 'CERT_PATH=%q\n' "${CERT_PATH:-}"
+    printf 'CA_PATH=%q\n' "${CA_PATH:-}"
+    printf 'KEY_PATH=%q\n' "${KEY_PATH:-}"
+    printf 'VPN_POOL_RANGE=%q\n' "${VPN_POOL_RANGE:-}"
+    printf 'VPN_POOL_CIDR=%q\n' "${VPN_POOL_CIDR:-}"
+    printf 'VPN_DNS=%q\n' "${VPN_DNS:-}"
+    printf 'UPLINK_IF=%q\n' "${UPLINK_IF:-}"
+    printf 'DPD_DELAY=%q\n' "${DPD_DELAY:-}"
+    printf 'IKE_PROPOSALS=%q\n' "${IKE_PROPOSALS:-}"
+    printf 'ESP_PROPOSALS=%q\n' "${ESP_PROPOSALS:-}"
+    printf 'LOCAL_TS=%q\n' "${LOCAL_TS:-}"
+  } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
 
@@ -159,6 +159,15 @@ detect_service_name() {
 service_active() {
   SERVICE_NAME="$(detect_service_name)"
   systemctl is-active --quiet "${SERVICE_NAME}.service"
+}
+
+restart_vpn_service() {
+  local service_name
+  service_name="$(detect_service_name)"
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable "${service_name}.service" >/dev/null 2>&1 || true
+  systemctl restart "${service_name}.service"
 }
 
 detect_uplink_if() {
@@ -300,6 +309,28 @@ html_escape() {
   s="${s//>/&gt;}"
   s="${s//\"/&quot;}"
   printf '%s' "$s"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    printf '%s-%s-%s-%s-%s\n' \
+      "$(openssl rand -hex 4)" \
+      "$(openssl rand -hex 2)" \
+      "$(openssl rand -hex 2)" \
+      "$(openssl rand -hex 2)" \
+      "$(openssl rand -hex 6)"
+  fi
 }
 
 interface_exists() {
@@ -761,7 +792,8 @@ enable_sysctl() {
   cat >"$SYSCTL_FILE" <<'EOF_SYSCTL'
 net.ipv4.ip_forward=1
 EOF_SYSCTL
-  sysctl --system >/dev/null
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -p "$SYSCTL_FILE" >/dev/null
 }
 
 escape_swanctl() {
@@ -1400,8 +1432,8 @@ select_group_prompt() {
 make_ios_mobileconfig() {
   local host="$1" display_name="$2" out_file="$3"
   local uuid_root uuid_vpn payload_id root_id
-  uuid_root=$(uuid)
-  uuid_vpn=$(uuid)
+  uuid_root=$(new_uuid)
+  uuid_vpn=$(new_uuid)
   payload_id="com.nikitid.ikev2.$(date +%s).$(openssl rand -hex 4)"
   root_id="com.nikitid.ikev2.root.$(date +%s).$(openssl rand -hex 4)"
   cat >"$out_file" <<EOF_PROFILE
