@@ -43,7 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/s
 Run a tagged release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.1/scripts/ikev2-manager.sh)
 ```
 
 ## Notes
