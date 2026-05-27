@@ -592,6 +592,7 @@ ensure_packages() {
     curl \
     openssl \
     iproute2 \
+    kmod \
     iptables \
     iptables-persistent \
     strongswan-swanctl \
@@ -786,6 +787,40 @@ uninstall_cleanup() {
   echo
   echo "IKEv2 manager setup removed."
   pause
+}
+
+ensure_kernel_ipsec_support() {
+  local required_modules=(xfrm_user esp4)
+  local optional_modules=(af_key ah4 xfrm4_tunnel rfc4106 gcm aes aesni_intel)
+  local module failed=0
+
+  if command -v modprobe >/dev/null 2>&1; then
+    for module in "${required_modules[@]}"; do
+      if ! modprobe "$module" >/dev/null 2>&1; then
+        echo "Kernel module unavailable: $module"
+        failed=1
+      fi
+    done
+    for module in "${optional_modules[@]}"; do
+      modprobe "$module" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if ! ip xfrm state >/dev/null 2>&1; then
+    echo "Kernel XFRM/IPsec API is not available."
+    failed=1
+  fi
+
+  if [[ ! -r /proc/net/xfrm_stat ]]; then
+    echo "/proc/net/xfrm_stat is not available."
+    failed=1
+  fi
+
+  if (( failed )); then
+    echo "This kernel does not expose the IPsec/XFRM support required by strongSwan."
+    echo "Use a distro/kernel with CONFIG_XFRM and ESP support enabled, or ask the VPS provider to enable IPsec."
+    return 1
+  fi
 }
 
 enable_sysctl() {
@@ -1100,6 +1135,12 @@ install_wizard() {
   echo "Writing manager config..."
   INSTALLED=0
   save_config
+
+  echo "Checking kernel IPsec support..."
+  if ! ensure_kernel_ipsec_support; then
+    pause
+    return 1
+  fi
 
   echo "Enabling IPv4 forwarding..."
   if ! enable_sysctl; then
@@ -2558,6 +2599,16 @@ show_diagnostics() {
   echo "Pool CIDR:    ${VPN_POOL_CIDR}"
   echo "Pool range:   ${VPN_POOL_RANGE}"
   echo "Client DNS:   ${VPN_DNS}"
+  echo
+  echo "Kernel IPsec checks"
+  echo "-------------------"
+  echo "XFRM API:      $(ip xfrm state >/dev/null 2>&1 && echo yes || echo no)"
+  echo "xfrm_stat:     $([[ -r /proc/net/xfrm_stat ]] && echo yes || echo no)"
+  if command -v lsmod >/dev/null 2>&1; then
+    echo "xfrm_user:     $(lsmod | awk '{print $1}' | grep -qx xfrm_user && echo loaded || echo missing)"
+    echo "esp4:          $(lsmod | awk '{print $1}' | grep -qx esp4 && echo loaded || echo missing)"
+    echo "rfc4106/gcm:   $(lsmod | awk '{print $1}' | grep -Eq '^(rfc4106|gcm)$' && echo loaded || echo missing)"
+  fi
   echo
   echo "Certificate summary"
   echo "-------------------"
