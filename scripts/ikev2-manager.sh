@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
