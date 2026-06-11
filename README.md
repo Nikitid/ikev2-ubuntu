@@ -52,6 +52,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.1
 - For `http-01` certificate validation, TCP port `80` must be reachable from the internet.
 - For `dns-01`, you need an `acme.sh` DNS provider name and its required API credentials.
 - External cloud firewalls or security groups must allow UDP `500` and UDP `4500` for IKEv2.
-- The script writes managed state under `/opt/ikev2-manager`.
+- The script writes managed state under `/opt/ikev2-manager` (root-only, `chmod 700`).
+- VPN user passwords are stored in plaintext in `/opt/ikev2-manager/users.db` — this is required by EAP-MSCHAPv2, which needs the original password on the server.
+- Exported client bundles under `/opt/ikev2-manager/exports` contain plaintext credentials; treat them as secrets when copying off the server.
 - VPN configuration is generated at `/etc/swanctl/swanctl.conf`.
 - Firewall rules are applied through iptables and persisted when `iptables-save` is available.
+
+## Development
+
+```bash
+bash -n scripts/ikev2-manager.sh
+shellcheck scripts/ikev2-manager.sh tests/run-tests.sh
+shfmt -i 2 -bn -ci -d scripts/ikev2-manager.sh tests/run-tests.sh
+bash tests/run-tests.sh
+```
