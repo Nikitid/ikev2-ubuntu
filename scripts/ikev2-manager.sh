@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
+# Bash 5.2+ expands & in ${var//pat/repl} to the match by default,
+# which corrupts replacements like &lt; in html_escape.
+shopt -u patsub_replacement 2>/dev/null || true
 
 SCRIPT_VERSION="1.0.1"
 MANAGER_DIR="/opt/ikev2-manager"
@@ -72,6 +75,11 @@ require_root() {
   fi
 }
 
+ensure_manager_dir() {
+  mkdir -p "$MANAGER_DIR"
+  chmod 700 "$MANAGER_DIR"
+}
+
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
     # shellcheck disable=SC1090
@@ -101,7 +109,7 @@ effective_installed() {
 }
 
 save_config() {
-  mkdir -p "$MANAGER_DIR"
+  ensure_manager_dir
   {
     printf 'INSTALLED=%q\n' "${INSTALLED:-0}"
     printf 'DOMAIN=%q\n' "${DOMAIN:-}"
@@ -177,10 +185,10 @@ detect_uplink_if() {
 detect_default_dns() {
   local dns_list=""
   if command -v resolvectl >/dev/null 2>&1; then
-    dns_list=$(resolvectl dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '!seen[$0]++' | paste -sd, -)
+    dns_list=$(resolvectl dns 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.' | awk '!seen[$0]++' | paste -sd, -)
   fi
   if [[ -z "$dns_list" ]]; then
-    dns_list=$(awk '/^nameserver /{print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | awk '!seen[$0]++' | paste -sd, -)
+    dns_list=$(awk '/^nameserver /{print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | grep -v '^127\.' | awk '!seen[$0]++' | paste -sd, -)
   fi
   echo "$dns_list"
 }
@@ -191,7 +199,8 @@ normalize_dns_list() {
   input="${input//;/,}"
   while IFS=',' read -r -a __parts; do
     for part in "${__parts[@]}"; do
-      if [[ "$part" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      # Loopback and unspecified addresses are useless as client DNS.
+      if [[ "$part" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && ! "$part" =~ ^(127\.|0\.) ]]; then
         if [[ -z "$out" ]]; then
           out="$part"
         else
@@ -208,13 +217,31 @@ normalize_dns_list() {
 }
 
 valid_ipv4() {
-  local ip="$1" IFS=.
+  local ip="$1" o1 o2 o3 o4 oct IFS=.
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
   read -r o1 o2 o3 o4 <<<"$ip"
   for oct in "$o1" "$o2" "$o3" "$o4"; do
-    [[ "$oct" =~ ^[0-9]+$ ]] || return 1
-    ((oct >= 0 && oct <= 255)) || return 1
+    ((10#$oct >= 0 && 10#$oct <= 255)) || return 1
   done
+}
+
+ip_to_int() {
+  local o1 o2 o3 o4 IFS=.
+  read -r o1 o2 o3 o4 <<<"$1"
+  echo $(((10#$o1 << 24) | (10#$o2 << 16) | (10#$o3 << 8) | 10#$o4))
+}
+
+cidr_contains() {
+  local cidr="$1" ip="$2" base prefix mask net
+  base="${cidr%/*}"
+  prefix="${cidr#*/}"
+  if ((prefix == 0)); then
+    mask=0
+  else
+    mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+  fi
+  net=$(($(ip_to_int "$base") & mask))
+  ((($(ip_to_int "$ip") & mask) == net))
 }
 
 valid_cidr() {
@@ -233,6 +260,7 @@ valid_range() {
   end="${BASH_REMATCH[2]}"
   valid_ipv4 "$start" || return 1
   valid_ipv4 "$end" || return 1
+  (($(ip_to_int "$start") <= $(ip_to_int "$end")))
 }
 
 valid_domain_name() {
@@ -293,13 +321,6 @@ normalize_platform() {
     "") echo "unknown" ;;
     *) echo "$p" ;;
   esac
-}
-
-escape_conf_value() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\'/\'\\\'\'}"
-  printf '%s' "$s"
 }
 
 html_escape() {
@@ -512,28 +533,6 @@ ask() {
   fi
 }
 
-ask_secret_multiline() {
-  local prompt="$1"
-  local line
-  echo "$prompt"
-  echo -e "${YELLOW}Enter KEY=VALUE lines. Empty line finishes input.${NC}"
-  : >"$ACME_ENV_FILE"
-  chmod 600 "$ACME_ENV_FILE"
-  while true; do
-    read -r -p "> " line || true
-    [[ -z "$line" ]] && break
-    if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ ]]; then
-      echo "Invalid format. Use KEY=VALUE."
-      continue
-    fi
-    local key value
-    key="${line%%=*}"
-    value="${line#*=}"
-    printf 'export %s=%q
-' "$key" "$value" >>"$ACME_ENV_FILE"
-  done
-}
-
 ask_secret_multiline_generic() {
   local line
   echo -e "${YELLOW}Enter KEY=VALUE lines. Empty line finishes input.${NC}"
@@ -555,7 +554,7 @@ ask_secret_multiline_generic() {
 }
 
 ask_acme_provider_env() {
-  mkdir -p "$MANAGER_DIR"
+  ensure_manager_dir
   : >"$ACME_ENV_FILE"
   chmod 600 "$ACME_ENV_FILE"
 
@@ -606,18 +605,23 @@ ensure_acme_installed() {
     return 0
   fi
 
-  local installer="/tmp/acme-install.sh"
-  curl -fsSL https://get.acme.sh -o "$installer"
-  if [[ -n "${ACME_EMAIL:-}" ]]; then
-    sh "$installer" email="$ACME_EMAIL"
+  local installer rc=0
+  installer=$(mktemp) || return 1
+  if curl -fsSL https://get.acme.sh -o "$installer"; then
+    if [[ -n "${ACME_EMAIL:-}" ]]; then
+      sh "$installer" email="$ACME_EMAIL" || rc=1
+    else
+      sh "$installer" || rc=1
+    fi
   else
-    sh "$installer"
+    rc=1
   fi
-  [[ -x "$ACME_BIN" ]]
+  rm -f "$installer"
+  ((rc == 0)) && [[ -x "$ACME_BIN" ]]
 }
 
 write_firewall_script() {
-  mkdir -p "$MANAGER_DIR"
+  ensure_manager_dir
   cat >"$FIREWALL_SCRIPT" <<EOF_FW
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -823,7 +827,7 @@ ensure_kernel_ipsec_support() {
     failed=1
   fi
 
-  if (( failed )); then
+  if ((failed)); then
     echo "This kernel does not expose the IPsec/XFRM support required by strongSwan."
     echo "Use a distro/kernel with CONFIG_XFRM and ESP support enabled, or ask the VPS provider to enable IPsec."
     return 1
@@ -898,13 +902,16 @@ secrets {
 EOF_HEAD
 
     if [[ -f "$USERS_DB" ]]; then
-      local db_user db_pass db_group db_platform _db_rest esc_user esc_pass
+      local db_user db_pass db_group db_platform _db_rest esc_user esc_pass idx=0
       while IFS='|' read -r db_user db_pass db_group db_platform _db_rest; do
         [[ -z "${db_user// /}" || "$db_user" == "username" ]] && continue
         esc_user=$(escape_swanctl "$db_user")
         esc_pass=$(escape_swanctl "$db_pass")
+        idx=$((idx + 1))
+        # Section names are numbered: usernames may contain characters
+        # (e.g. dots) that the strongswan settings parser rejects in names.
         cat <<EOF_USER
-  eap-${esc_user} {
+  eap-${idx} {
     id = "${esc_user}"
     secret = "${esc_pass}"
   }
@@ -929,6 +936,29 @@ load_swanctl() {
   fi
 }
 
+reload_vpn_credentials() {
+  if command -v swanctl >/dev/null 2>&1 && swanctl --load-creds >/dev/null 2>&1; then
+    load_swanctl
+    return 0
+  fi
+  restart_vpn_service
+}
+
+# Best-effort: terminate IKE SAs whose identity matches the given username,
+# so a removed user is cut off without restarting the whole service.
+terminate_user_sas() {
+  local user="$1" ids id
+  command -v swanctl >/dev/null 2>&1 || return 0
+  ids=$(swanctl --list-sas 2>/dev/null | awk -v u="'${user}'" '
+    match($0, /#[0-9]+, /) { uid = substr($0, RSTART + 1, RLENGTH - 3) }
+    uid != "" && index($0, u) { print uid; uid = "" }
+  ' | sort -un)
+  [[ -n "$ids" ]] || return 0
+  for id in $ids; do
+    swanctl --terminate --ike-id "$id" --timeout 5 >/dev/null 2>&1 || true
+  done
+}
+
 issue_and_install_cert() {
   [[ -n "${DOMAIN:-}" ]] || {
     echo "Domain is not set."
@@ -942,6 +972,7 @@ issue_and_install_cert() {
 
   "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null
 
+  local rc=0
   case "${ACME_MODE:-dns-01}" in
     dns-01)
       [[ -n "${DNS_PROVIDER:-}" ]] || {
@@ -954,12 +985,12 @@ issue_and_install_cert() {
       }
       # shellcheck disable=SC1090
       source "$ACME_ENV_FILE"
-      "$ACME_BIN" --issue -d "$DOMAIN" --dns "$DNS_PROVIDER" --keylength 2048
+      "$ACME_BIN" --issue -d "$DOMAIN" --dns "$DNS_PROVIDER" --keylength 2048 || rc=$?
       ;;
     http-01)
       echo "Using HTTP-01 standalone mode."
       echo "The host must be reachable from the Internet on TCP/80 during validation."
-      "$ACME_BIN" --issue -d "$DOMAIN" --standalone --keylength 2048
+      "$ACME_BIN" --issue -d "$DOMAIN" --standalone --keylength 2048 || rc=$?
       ;;
     *)
       echo "Unsupported ACME mode: ${ACME_MODE}"
@@ -967,11 +998,19 @@ issue_and_install_cert() {
       ;;
   esac
 
+  # acme.sh returns 2 (RENEW_SKIP) when the certificate is still valid.
+  if ((rc == 2)); then
+    echo "Certificate is still valid; skipping issuance, reinstalling existing files."
+  elif ((rc != 0)); then
+    return "$rc"
+  fi
+
+  # Reload credentials without dropping active tunnels; restart only as fallback.
   "$ACME_BIN" --install-cert -d "$DOMAIN" \
     --cert-file "$CERT_PATH" \
     --ca-file "$CA_PATH" \
     --key-file "$KEY_PATH" \
-    --reloadcmd "systemctl restart $(detect_service_name)"
+    --reloadcmd "swanctl --load-creds >/dev/null 2>&1 || systemctl restart $(detect_service_name)"
 }
 validate_acme_env() {
   case "${ACME_MODE:-dns-01}" in
@@ -1058,6 +1097,14 @@ validate_install_inputs() {
     return 1
   }
 
+  local range_start range_end
+  range_start="${VPN_POOL_RANGE%%-*}"
+  range_end="${VPN_POOL_RANGE##*-}"
+  if ! cidr_contains "$VPN_POOL_CIDR" "$range_start" || ! cidr_contains "$VPN_POOL_CIDR" "$range_end"; then
+    echo "VPN pool range is outside the VPN pool CIDR; NAT rules would not match client traffic."
+    return 1
+  fi
+
   VPN_DNS=$(normalize_dns_list "$VPN_DNS")
   [[ -n "$VPN_DNS" ]] || {
     echo "VPN DNS is invalid. Use IPv4 addresses separated by commas."
@@ -1075,7 +1122,7 @@ install_wizard() {
     return 1
   fi
 
-  mkdir -p "$MANAGER_DIR"
+  ensure_manager_dir
 
   DOMAIN=$(ask "Domain name for VPN server" "${DOMAIN:-}")
   ACME_EMAIL=$(ask "Email for acme.sh (optional)" "${ACME_EMAIL:-}")
@@ -1207,7 +1254,7 @@ random_password() {
 }
 
 ensure_users_db() {
-  mkdir -p "$MANAGER_DIR"
+  ensure_manager_dir
   touch "$USERS_DB"
   chmod 600 "$USERS_DB"
   migrate_users_db
@@ -1272,8 +1319,8 @@ add_or_update_user() {
     password=$(random_password)
   else
     password=$(ask "Password")
-    if [[ -z "$password" || "$password" == *'|'* || "$password" == *$'\t'* || "$password" == *$'\n'* ]]; then
-      echo "Password is empty or contains invalid characters."
+    if [[ -z "$password" || "$password" == *'|'* || "$password" == *'"'* || "$password" == *"\\"* || "$password" == *$'\t'* || "$password" == *$'\n'* ]]; then
+      echo "Password is empty or contains invalid characters (| \" \\ tab newline)."
       pause
       return 1
     fi
@@ -1297,17 +1344,12 @@ add_or_update_user() {
 
   generate_swanctl_conf
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
-  if ! swanctl --load-all >/dev/null 2>&1; then
+  # --clear-creds drops stale in-memory secrets (e.g. an old password).
+  if ! swanctl --load-all --clear-creds >/dev/null 2>&1; then
     echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
   fi
-  if ! restart_vpn_service; then
-    echo "VPN service reload failed after user update."
-    pause
-    return 1
-  fi
-  load_swanctl
 
   echo
   if [[ "$found" -eq 1 ]]; then
@@ -1392,17 +1434,13 @@ remove_user_menu() {
 
   generate_swanctl_conf
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
-  if ! swanctl --load-all >/dev/null 2>&1; then
+  # --clear-creds ensures the removed user's secret is unloaded from charon.
+  if ! swanctl --load-all --clear-creds >/dev/null 2>&1; then
     echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
   fi
-  if ! restart_vpn_service; then
-    echo "VPN service reload failed after user removal."
-    pause
-    return 1
-  fi
-  load_swanctl
+  terminate_user_sas "${users[$((choice - 1))]}"
 
   echo "User removed: ${users[$((choice - 1))]}"
   pause
@@ -1525,6 +1563,11 @@ EOF_PROFILE
 
 make_ubuntu_script() {
   local host="$1" out_file="$2"
+  local ca_content=""
+  if [[ -f "$CA_PATH" ]]; then
+    ca_content="$(<"$CA_PATH")"
+  fi
+
   cat >"$out_file" <<EOF_UBUNTU
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1533,11 +1576,25 @@ read -r -s -p "Password: " VPN_PASS
 echo
 sudo apt-get update
 sudo apt-get install -y strongswan libcharon-extra-plugins libcharon-extauth-plugins
+EOF_UBUNTU
+
+  # charon does not use the system CA store, so ship the issuer CA with the script.
+  if [[ -n "$ca_content" ]]; then
+    cat >>"$out_file" <<EOF_CA_BLOCK
+sudo mkdir -p /etc/ipsec.d/cacerts
+sudo tee '/etc/ipsec.d/cacerts/${host}-ca.pem' >/dev/null <<'EOF_CA'
+${ca_content}
+EOF_CA
+EOF_CA_BLOCK
+  fi
+
+  cat >>"$out_file" <<EOF_UBUNTU
 sudo tee /etc/ipsec.conf >/dev/null <<EOF
 conn ikev2
     keyexchange=ikev2
     right=${host}
     rightid=@${host}
+    rightsubnet=0.0.0.0/0
     rightauth=pubkey
     left=%defaultroute
     leftsourceip=%config
@@ -1548,6 +1605,7 @@ EOF
 sudo tee /etc/ipsec.secrets >/dev/null <<EOF
 \$VPN_USER : EAP "\$VPN_PASS"
 EOF
+sudo chmod 600 /etc/ipsec.secrets
 sudo systemctl restart strongswan-starter 2>/dev/null || sudo systemctl restart strongswan
 sudo ipsec up ikev2 || true
 EOF_UBUNTU
@@ -1658,6 +1716,7 @@ generate_client_bundle_local() {
   ts=$(date +%Y%m%d-%H%M%S)
   bundle_dir="$EXPORTS_DIR/${DOMAIN}_${group}_${ts}"
   mkdir -p "$bundle_dir/windows" "$bundle_dir/ios" "$bundle_dir/macos" "$bundle_dir/ubuntu"
+  chmod 700 "$EXPORTS_DIR"
 
   if [[ -n "$(get_group_users "$group" "windows")" ]]; then
     windows_message_file "$group" "$bundle_dir/windows/windows-guide.html"
@@ -1704,6 +1763,9 @@ EOF_WINPS
     ubuntu_message_file "$group" "$bundle_dir/ubuntu/ubuntu-guide.html"
     make_ubuntu_script "$DOMAIN" "$bundle_dir/ubuntu/${DOMAIN}-ubuntu.sh"
   fi
+
+  # Guides contain plaintext credentials; keep the bundle root-only.
+  chmod -R go-rwx "$bundle_dir"
 
   echo "Client bundle exported locally:"
   echo "$bundle_dir"
@@ -1931,6 +1993,8 @@ ProtectKernelTunables=true
 [Install]
 WantedBy=multi-user.target
 EOF_MTSVC
+  # The unit embeds the proxy secret in ExecStart.
+  chmod 600 "$MT_SERVICE_FILE"
 }
 
 mt_service_status() {
@@ -2001,6 +2065,10 @@ mt_firewall_add() {
   iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT 2>/dev/null \
     || iptables -I INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT
 
+  # The internal stats port (--http-stats) must not be reachable from outside.
+  iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null \
+    || iptables -I INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP
+
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
   fi
@@ -2011,6 +2079,10 @@ mt_firewall_remove() {
 
   while iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT 2>/dev/null; do
     iptables -D INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT || break
+  done
+
+  while iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
+    iptables -D INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP || break
   done
 
   if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -2376,7 +2448,7 @@ mt_status_block() {
   fi
 
   echo -e "  ${CYAN}MTProxy Manager by Nikitid${NC}"
-  printf '%27b\n' "${WHITE}v1.2-integrated${NC}"
+  printf '%27b\n' "${WHITE}v${SCRIPT_VERSION}${NC}"
   echo
 
   status_line "Install status:" "$install_status"
@@ -2650,12 +2722,11 @@ reissue_certificate() {
     pause
     return 1
   fi
-  if ! restart_vpn_service; then
-    echo "VPN service restart failed after certificate update."
+  if ! reload_vpn_credentials; then
+    echo "VPN credentials reload failed after certificate update."
     pause
     return 1
   fi
-  load_swanctl
   echo "Certificate reissued and installed."
   pause
 }
@@ -2880,4 +2951,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
