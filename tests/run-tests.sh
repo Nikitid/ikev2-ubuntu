@@ -87,8 +87,46 @@ assert_fail "valid_range rejects reversed range" valid_range "10.20.20.250-10.20
 assert_fail "valid_range rejects missing dash" valid_range "10.20.20.10"
 assert_fail "valid_range rejects bad end" valid_range "10.20.20.10-foo"
 
+# valid_ipv6
+assert_ok "valid_ipv6 accepts ::1" valid_ipv6 "::1"
+assert_ok "valid_ipv6 accepts ::" valid_ipv6 "::"
+assert_ok "valid_ipv6 accepts 2001:db8::1" valid_ipv6 "2001:db8::1"
+assert_ok "valid_ipv6 accepts full form" valid_ipv6 "2001:0db8:0000:0000:0000:0000:0000:0001"
+assert_ok "valid_ipv6 accepts 1:2:3:4:5:6:7:8" valid_ipv6 "1:2:3:4:5:6:7:8"
+assert_ok "valid_ipv6 accepts trailing ::" valid_ipv6 "fd42:4242:4242:1::"
+assert_ok "valid_ipv6 accepts 7 groups with ::" valid_ipv6 "1:2:3:4:5:6:7::"
+assert_fail "valid_ipv6 rejects IPv4" valid_ipv6 "1.2.3.4"
+assert_fail "valid_ipv6 rejects double compression" valid_ipv6 "2001::db8::1"
+assert_fail "valid_ipv6 rejects triple colon" valid_ipv6 "2001:::1"
+assert_fail "valid_ipv6 rejects long group" valid_ipv6 "12345::"
+assert_fail "valid_ipv6 rejects 9 groups" valid_ipv6 "1:2:3:4:5:6:7:8:9"
+assert_fail "valid_ipv6 rejects 7 groups without ::" valid_ipv6 "1:2:3:4:5:6:7"
+assert_fail "valid_ipv6 rejects trailing single colon" valid_ipv6 "1::3:"
+assert_fail "valid_ipv6 rejects leading single colon" valid_ipv6 ":1::2"
+assert_fail "valid_ipv6 rejects non-hex" valid_ipv6 "gggg::1"
+assert_fail "valid_ipv6 rejects empty" valid_ipv6 ""
+
+# valid_ipv6_cidr
+assert_ok "valid_ipv6_cidr accepts ULA /112" valid_ipv6_cidr "fd42:4242:4242:1::/112"
+assert_ok "valid_ipv6_cidr accepts ::/0" valid_ipv6_cidr "::/0"
+assert_fail "valid_ipv6_cidr rejects /129" valid_ipv6_cidr "fd42::/129"
+assert_fail "valid_ipv6_cidr rejects missing prefix" valid_ipv6_cidr "fd42::"
+assert_fail "valid_ipv6_cidr rejects bad address" valid_ipv6_cidr "fd42::zz/64"
+
+# valid_ipv6_mode
+assert_ok "valid_ipv6_mode accepts block" valid_ipv6_mode "block"
+assert_ok "valid_ipv6_mode accepts nat" valid_ipv6_mode "nat"
+assert_ok "valid_ipv6_mode accepts off" valid_ipv6_mode "off"
+assert_fail "valid_ipv6_mode rejects on" valid_ipv6_mode "on"
+
+# dns_list_drop_ipv6
+assert_eq "dns_list_drop_ipv6 keeps IPv4 only" "1.1.1.1,8.8.8.8" "$(dns_list_drop_ipv6 "1.1.1.1,2606:4700:4700::1111,8.8.8.8")"
+assert_eq "dns_list_drop_ipv6 may empty the list" "" "$(dns_list_drop_ipv6 "2606:4700:4700::1111")"
+
 # normalize_dns_list
 assert_eq "normalize_dns_list keeps order and strips spaces" "1.1.1.1,8.8.8.8" "$(normalize_dns_list "1.1.1.1; 8.8.8.8")"
+assert_eq "normalize_dns_list accepts IPv6" "2606:4700:4700::1111,1.1.1.1" "$(normalize_dns_list "2606:4700:4700::1111,1.1.1.1")"
+assert_eq "normalize_dns_list drops IPv6 loopback" "8.8.8.8" "$(normalize_dns_list "::1,8.8.8.8")"
 assert_eq "normalize_dns_list dedupes" "1.1.1.1" "$(normalize_dns_list "1.1.1.1,1.1.1.1")"
 assert_eq "normalize_dns_list drops loopback" "1.1.1.1" "$(normalize_dns_list "127.0.0.53,1.1.1.1")"
 assert_eq "normalize_dns_list drops unspecified" "9.9.9.9" "$(normalize_dns_list "0.0.0.0,9.9.9.9")"

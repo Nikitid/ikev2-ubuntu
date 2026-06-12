@@ -17,6 +17,7 @@ The script focuses on a practical single-server setup: strongSwan with `swanctl`
 - Manage VPN users with username, password, group, and platform labels
 - Export local client bundles for Windows, iOS, macOS, and Ubuntu
 - Configure IPv4 forwarding and iptables NAT rules
+- IPv6 modes: leak protection (default), full IPv6 via NAT66, or IPv4-only
 - Reapply firewall rules and reissue certificates from the menu
 - Show service status, diagnostics, recent logs, and client info
 - Uninstall managed VPN files, firewall rules, ACME bindings, and strongSwan packages
@@ -52,6 +53,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.1
 - For `http-01` certificate validation, TCP port `80` must be reachable from the internet.
 - For `dns-01`, you need an `acme.sh` DNS provider name and its required API credentials.
 - External cloud firewalls or security groups must allow UDP `500` and UDP `4500` for IKEv2.
+- IPv6 modes: `block` (default) hands clients a ULA address and a `::/0` selector, then drops their IPv6 on the server — dual-stack clients cannot leak IPv6 around the tunnel; `nat` gives clients working IPv6 through NAT66 (the host needs a global IPv6 address); `off` keeps the old IPv4-only behavior and leaks IPv6 on dual-stack clients.
 - The script writes managed state under `/opt/ikev2-manager` (root-only, `chmod 700`).
 - VPN user passwords are stored in plaintext in `/opt/ikev2-manager/users.db` — this is required by EAP-MSCHAPv2, which needs the original password on the server.
 - Exported client bundles under `/opt/ikev2-manager/exports` contain plaintext credentials; treat them as secrets when copying off the server.
