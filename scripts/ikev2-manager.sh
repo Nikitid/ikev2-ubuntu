@@ -4,7 +4,7 @@ set -uo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.1.0"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
@@ -59,6 +59,10 @@ DEFAULT_CA_PATH="/etc/swanctl/x509ca/issuer-ca.pem"
 DEFAULT_KEY_PATH="/etc/swanctl/private/ikev2.key"
 DEFAULT_POOL_RANGE="10.20.20.10-10.20.20.250"
 DEFAULT_POOL_CIDR="10.20.20.0/24"
+# IPv6 behavior: block = clients tunnel IPv6 and the server drops it (no
+# leaks on dual-stack clients), nat = full IPv6 via NAT66, off = IPv4 only.
+DEFAULT_IPV6_MODE="block"
+DEFAULT_POOL6_CIDR="fd42:4242:4242:1::/112"
 DEFAULT_DNS_FALLBACK="1.1.1.1,1.0.0.1"
 DEFAULT_ACME_MODE="dns-01"
 DEFAULT_DPD_DELAY="30s"
@@ -92,6 +96,8 @@ load_config() {
   KEY_PATH="${KEY_PATH:-$DEFAULT_KEY_PATH}"
   VPN_POOL_RANGE="${VPN_POOL_RANGE:-$DEFAULT_POOL_RANGE}"
   VPN_POOL_CIDR="${VPN_POOL_CIDR:-$DEFAULT_POOL_CIDR}"
+  IPV6_MODE="${IPV6_MODE:-$DEFAULT_IPV6_MODE}"
+  VPN_POOL6_CIDR="${VPN_POOL6_CIDR:-$DEFAULT_POOL6_CIDR}"
   ACME_MODE="${ACME_MODE:-$DEFAULT_ACME_MODE}"
   VPN_DNS="${VPN_DNS:-$(detect_default_dns || true)}"
   VPN_DNS="${VPN_DNS:-$DEFAULT_DNS_FALLBACK}"
@@ -123,6 +129,8 @@ save_config() {
     printf 'KEY_PATH=%q\n' "${KEY_PATH:-}"
     printf 'VPN_POOL_RANGE=%q\n' "${VPN_POOL_RANGE:-}"
     printf 'VPN_POOL_CIDR=%q\n' "${VPN_POOL_CIDR:-}"
+    printf 'IPV6_MODE=%q\n' "${IPV6_MODE:-}"
+    printf 'VPN_POOL6_CIDR=%q\n' "${VPN_POOL6_CIDR:-}"
     printf 'VPN_DNS=%q\n' "${VPN_DNS:-}"
     printf 'UPLINK_IF=%q\n' "${UPLINK_IF:-}"
     printf 'DPD_DELAY=%q\n' "${DPD_DELAY:-}"
@@ -194,26 +202,43 @@ detect_default_dns() {
 }
 
 normalize_dns_list() {
-  local input="$1" out="" part
+  local input="$1" out="" part keep
   input="${input// /}"
   input="${input//;/,}"
   while IFS=',' read -r -a __parts; do
     for part in "${__parts[@]}"; do
+      keep=0
       # Loopback and unspecified addresses are useless as client DNS.
       if [[ "$part" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && ! "$part" =~ ^(127\.|0\.) ]]; then
-        if [[ -z "$out" ]]; then
-          out="$part"
-        else
-          case ",$out," in
-            *",$part,"*) ;;
-            *) out+=",$part" ;;
-          esac
-        fi
+        keep=1
+      elif [[ "$part" == *:* && "$part" != "::" && "$part" != "::1" ]] && valid_ipv6 "$part"; then
+        keep=1
+      fi
+      ((keep)) || continue
+      if [[ -z "$out" ]]; then
+        out="$part"
+      else
+        case ",$out," in
+          *",$part,"*) ;;
+          *) out+=",$part" ;;
+        esac
       fi
     done
     break
   done <<<"$input"
   echo "$out"
+}
+
+# Drop IPv6 resolvers from a comma-separated DNS list; they are unreachable
+# for clients unless full IPv6 (nat mode) is enabled.
+dns_list_drop_ipv6() {
+  local out="" part
+  local IFS=','
+  for part in $1; do
+    [[ "$part" == *:* ]] && continue
+    out+="${out:+,}$part"
+  done
+  printf '%s' "$out"
 }
 
 valid_ipv4() {
@@ -242,6 +267,53 @@ cidr_contains() {
   fi
   net=$(($(ip_to_int "$base") & mask))
   ((($(ip_to_int "$ip") & mask) == net))
+}
+
+valid_ipv6() {
+  local ip="$1" head tail g
+  [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  # A lone leading/trailing colon is only allowed as part of "::".
+  [[ "$ip" == :* && "$ip" != ::* ]] && return 1
+  [[ "$ip" == *: && "$ip" != *:: ]] && return 1
+  if [[ "$ip" == *::* ]]; then
+    [[ "$ip" == *::*::* || "$ip" == *:::* ]] && return 1
+    head="${ip%%::*}"
+    tail="${ip#*::}"
+    local -a hg=() tg=()
+    [[ -n "$head" ]] && IFS=':' read -r -a hg <<<"$head"
+    [[ -n "$tail" ]] && IFS=':' read -r -a tg <<<"$tail"
+    for g in "${hg[@]}" "${tg[@]}"; do
+      [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    ((${#hg[@]} + ${#tg[@]} <= 7))
+  else
+    local -a gs=()
+    IFS=':' read -r -a gs <<<"$ip"
+    ((${#gs[@]} == 8)) || return 1
+    for g in "${gs[@]}"; do
+      [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+  fi
+}
+
+valid_ipv6_cidr() {
+  local cidr="$1" ip prefix
+  [[ "$cidr" =~ ^([^/]+)/([0-9]{1,3})$ ]] || return 1
+  ip="${BASH_REMATCH[1]}"
+  prefix="${BASH_REMATCH[2]}"
+  valid_ipv6 "$ip" || return 1
+  ((10#$prefix >= 0 && 10#$prefix <= 128))
+}
+
+valid_ipv6_mode() {
+  case "$1" in
+    off | block | nat) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+host_has_global_ipv6() {
+  ip -6 route get 2001:4860:4860::8888 >/dev/null 2>&1
 }
 
 valid_cidr() {
@@ -509,6 +581,7 @@ render_header() {
   status_line "Firewall:" "$firewall_state"
   status_line "Auth:" "$auth_state"
   status_line "Pool / DNS:" "$quick_state"
+  status_line "IPv6 mode:" "${IPV6_MODE:-off}"
   status_line "MTProxy:" "$(mt_service_status)"
   status_line "3x-ui:" "$(xui_status)"
   echo
@@ -626,6 +699,7 @@ write_firewall_script() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 POOL_CIDR='${VPN_POOL_CIDR}'
+POOL6_CIDR='${VPN_POOL6_CIDR}'
 UPLINK_IF='${UPLINK_IF}'
 
 # IKEv2 server ports. External NAT/security-group rules still have to allow UDP/500 and UDP/4500.
@@ -641,12 +715,52 @@ iptables -C FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 
   iptables -I FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT
 iptables -C FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
   iptables -I FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT
+EOF_FW
+
+  if [[ "${IPV6_MODE:-off}" != "off" ]]; then
+    cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_IN'
+
+if command -v ip6tables >/dev/null 2>&1; then
+  # Accept IKE over IPv6 transport.
+  ip6tables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1 || \
+    ip6tables -I INPUT -p udp --dport 500 -j ACCEPT
+  ip6tables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1 || \
+    ip6tables -I INPUT -p udp --dport 4500 -j ACCEPT
+EOF_FW6_IN
+    if [[ "$IPV6_MODE" == "nat" ]]; then
+      cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_NAT'
+
+  # Full IPv6 for clients through NAT66.
+  ip6tables -t nat -C POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1 || \
+    ip6tables -t nat -I POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+  ip6tables -C FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
+    ip6tables -I FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
+  ip6tables -C FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
+    ip6tables -I FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
+fi
+EOF_FW6_NAT
+    else
+      cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_BLOCK'
+
+  # Blackhole client IPv6 so dual-stack clients cannot leak around the tunnel.
+  ip6tables -C FORWARD -s "$POOL6_CIDR" -j DROP >/dev/null 2>&1 || \
+    ip6tables -A FORWARD -s "$POOL6_CIDR" -j DROP
+fi
+EOF_FW6_BLOCK
+    fi
+  fi
+
+  cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_SAVE'
 
 if command -v iptables-save >/dev/null 2>&1; then
   mkdir -p /etc/iptables
   iptables-save > /etc/iptables/rules.v4 || true
 fi
-EOF_FW
+if command -v ip6tables-save >/dev/null 2>&1; then
+  mkdir -p /etc/iptables
+  ip6tables-save > /etc/iptables/rules.v6 || true
+fi
+EOF_FW_SAVE
   chmod 700 "$FIREWALL_SCRIPT"
 }
 
@@ -699,6 +813,32 @@ remove_firewall_rules() {
     done
   fi
 
+  if command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1; do
+      ip6tables -D INPUT -p udp --dport 500 -j ACCEPT || break
+    done
+    while ip6tables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1; do
+      ip6tables -D INPUT -p udp --dport 4500 -j ACCEPT || break
+    done
+
+    if [[ -n "${VPN_POOL6_CIDR:-}" ]]; then
+      while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -j DROP >/dev/null 2>&1; do
+        ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -j DROP || break
+      done
+      if [[ -n "${UPLINK_IF:-}" ]]; then
+        while ip6tables -t nat -C POSTROUTING -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1; do
+          ip6tables -t nat -D POSTROUTING -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE || break
+        done
+        while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
+          ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT || break
+        done
+        while ip6tables -C FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
+          ip6tables -D FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT || break
+        done
+      fi
+    fi
+  fi
+
   if [[ -f "$FIREWALL_SERVICE" ]]; then
     systemctl disable --now ikev2-manager-firewall.service >/dev/null 2>&1 || true
     rm -f "$FIREWALL_SERVICE"
@@ -711,11 +851,16 @@ remove_firewall_rules() {
     mkdir -p /etc/iptables
     iptables-save >/etc/iptables/rules.v4 || true
   fi
+  if command -v ip6tables-save >/dev/null 2>&1; then
+    mkdir -p /etc/iptables
+    ip6tables-save >/etc/iptables/rules.v6 || true
+  fi
 }
 
 disable_sysctl() {
   rm -f "$SYSCTL_FILE"
   sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
   sysctl --system >/dev/null 2>&1 || true
 }
 
@@ -785,6 +930,8 @@ uninstall_cleanup() {
   DNS_PROVIDER=""
   VPN_POOL_RANGE="$DEFAULT_POOL_RANGE"
   VPN_POOL_CIDR="$DEFAULT_POOL_CIDR"
+  IPV6_MODE="$DEFAULT_IPV6_MODE"
+  VPN_POOL6_CIDR="$DEFAULT_POOL6_CIDR"
   VPN_DNS="$DEFAULT_DNS_FALLBACK"
   UPLINK_IF="$(detect_uplink_if || true)"
   LAST_ERROR=""
@@ -835,10 +982,16 @@ ensure_kernel_ipsec_support() {
 }
 
 enable_sysctl() {
-  cat >"$SYSCTL_FILE" <<'EOF_SYSCTL'
-net.ipv4.ip_forward=1
-EOF_SYSCTL
+  {
+    echo "net.ipv4.ip_forward=1"
+    if [[ "${IPV6_MODE:-off}" == "nat" ]]; then
+      echo "net.ipv6.conf.all.forwarding=1"
+    fi
+  } >"$SYSCTL_FILE"
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  if [[ "${IPV6_MODE:-off}" == "nat" ]]; then
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+  fi
   sysctl -p "$SYSCTL_FILE" >/dev/null
 }
 
@@ -853,6 +1006,20 @@ generate_swanctl_conf() {
   migrate_users_db
   mkdir -p /etc/swanctl /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
   backup_file "$SWANCTL_CONF"
+
+  # In block/nat modes clients get an IPv6 address and a ::/0 selector, so
+  # dual-stack devices route IPv6 into the tunnel instead of leaking it.
+  local effective_local_ts="$LOCAL_TS" pool_list="vpn_pool" pool6_block=""
+  if [[ "${IPV6_MODE:-off}" != "off" ]]; then
+    if [[ ",$LOCAL_TS," != *",::/0,"* ]]; then
+      effective_local_ts="${LOCAL_TS},::/0"
+    fi
+    pool_list="vpn_pool, vpn_pool6"
+    pool6_block="
+  vpn_pool6 {
+    addrs = ${VPN_POOL6_CIDR}
+  }"
+  fi
 
   {
     cat <<EOF_HEAD
@@ -881,13 +1048,13 @@ connections {
     children {
       net {
         esp_proposals = ${ESP_PROPOSALS}
-        local_ts = ${LOCAL_TS}
+        local_ts = ${effective_local_ts}
         dpd_action = clear
         start_action = none
       }
     }
 
-    pools = vpn_pool
+    pools = ${pool_list}
   }
 }
 
@@ -895,7 +1062,7 @@ pools {
   vpn_pool {
     addrs = ${VPN_POOL_RANGE}
     dns = ${VPN_DNS}
-  }
+  }${pool6_block}
 }
 
 secrets {
@@ -1105,9 +1272,26 @@ validate_install_inputs() {
     return 1
   fi
 
+  valid_ipv6_mode "$IPV6_MODE" || {
+    echo "IPv6 mode must be block, nat or off."
+    return 1
+  }
+  if [[ "$IPV6_MODE" != "off" ]]; then
+    valid_ipv6_cidr "$VPN_POOL6_CIDR" || {
+      echo "VPN IPv6 pool CIDR is invalid."
+      return 1
+    }
+  fi
+  if [[ "$IPV6_MODE" == "nat" ]] && ! host_has_global_ipv6; then
+    echo "Warning: no global IPv6 route detected on this host; NAT66 clients may not reach the Internet over IPv6."
+  fi
+
   VPN_DNS=$(normalize_dns_list "$VPN_DNS")
+  if [[ "$IPV6_MODE" != "nat" ]]; then
+    VPN_DNS=$(dns_list_drop_ipv6 "$VPN_DNS")
+  fi
   [[ -n "$VPN_DNS" ]] || {
-    echo "VPN DNS is invalid. Use IPv4 addresses separated by commas."
+    echo "VPN DNS is invalid. Use IP addresses separated by commas."
     return 1
   }
 }
@@ -1142,6 +1326,21 @@ install_wizard() {
   VPN_DNS=$(ask "DNS servers for VPN clients (comma-separated)" "${VPN_DNS:-$(detect_default_dns || true)}")
   VPN_DNS=$(normalize_dns_list "$VPN_DNS")
   VPN_DNS="${VPN_DNS:-$DEFAULT_DNS_FALLBACK}"
+
+  local ipv6_default="block"
+  if host_has_global_ipv6; then
+    ipv6_default="nat"
+  fi
+  echo
+  echo "IPv6 modes:"
+  echo "  block = clients tunnel IPv6 and the server drops it (prevents IPv6 leaks)"
+  echo "  nat   = full IPv6 for clients via NAT66 (host needs global IPv6)"
+  echo "  off   = IPv4 only (dual-stack clients will leak IPv6 outside the VPN)"
+  IPV6_MODE=$(ask "IPv6 mode (block/nat/off)" "${IPV6_MODE:-$ipv6_default}")
+  IPV6_MODE="${IPV6_MODE,,}"
+  if [[ "$IPV6_MODE" != "off" ]]; then
+    VPN_POOL6_CIDR=$(ask "VPN IPv6 pool (CIDR)" "${VPN_POOL6_CIDR:-$DEFAULT_POOL6_CIDR}")
+  fi
 
   if [[ "$ACME_MODE" == "http-01" ]]; then
     echo
@@ -1563,7 +1762,10 @@ EOF_PROFILE
 
 make_ubuntu_script() {
   local host="$1" out_file="$2"
-  local ca_content=""
+  local ca_content="" right_subnet="0.0.0.0/0"
+  if [[ "${IPV6_MODE:-off}" != "off" ]]; then
+    right_subnet="0.0.0.0/0,::/0"
+  fi
   if [[ -f "$CA_PATH" ]]; then
     ca_content="$(<"$CA_PATH")"
   fi
@@ -1594,7 +1796,7 @@ conn ikev2
     keyexchange=ikev2
     right=${host}
     rightid=@${host}
-    rightsubnet=0.0.0.0/0
+    rightsubnet=${right_subnet}
     rightauth=pubkey
     left=%defaultroute
     leftsourceip=%config
@@ -2068,6 +2270,10 @@ mt_firewall_add() {
   # The internal stats port (--http-stats) must not be reachable from outside.
   iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null \
     || iptables -I INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null \
+      || ip6tables -I INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP
+  fi
 
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -2084,6 +2290,12 @@ mt_firewall_remove() {
   while iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
     iptables -D INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP || break
   done
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    while ip6tables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
+      ip6tables -D INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP || break
+    done
+  fi
 
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -2374,9 +2586,10 @@ mt_change_tls_domain() {
 
 mt_client_ips_raw() {
   mt_load_config
+  # Peer column is "1.2.3.4:443" or "[2a00::1]:443"; strip port and brackets.
   ss -Htn state established "( sport = :${MT_PORT} )" 2>/dev/null \
     | awk '{print $4}' \
-    | cut -d: -f1 \
+    | sed -E 's/^\[//; s/\]?:[0-9]+$//' \
     | sed '/^$/d'
 }
 
@@ -2649,6 +2862,7 @@ IKE proposals: ${IKE_PROPOSALS}
 ESP proposals: ${ESP_PROPOSALS}
 Client DNS:    ${VPN_DNS}
 Pool range:    ${VPN_POOL_RANGE}
+IPv6 mode:     ${IPV6_MODE:-off}
 Uplink iface:  ${UPLINK_IF:-unset}
 
 Windows notes:
@@ -2677,6 +2891,12 @@ show_diagnostics() {
   echo "Uplink iface: ${UPLINK_IF:-unset}"
   echo "Pool CIDR:    ${VPN_POOL_CIDR}"
   echo "Pool range:   ${VPN_POOL_RANGE}"
+  echo "IPv6 mode:    ${IPV6_MODE:-off}"
+  if [[ "${IPV6_MODE:-off}" != "off" ]]; then
+    echo "IPv6 pool:    ${VPN_POOL6_CIDR}"
+    echo "IPv6 forward: $(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo '?')"
+    echo "Global IPv6:  $(host_has_global_ipv6 && echo yes || echo no)"
+  fi
   echo "Client DNS:   ${VPN_DNS}"
   echo
   echo "Kernel IPsec checks"
