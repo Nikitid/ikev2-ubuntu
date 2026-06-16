@@ -4,7 +4,7 @@ set -uo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
@@ -70,6 +70,10 @@ DEFAULT_IKE_PROPOSALS="aes256gcm16-prfsha384-ecp384,aes256-sha256-modp2048"
 DEFAULT_ESP_PROPOSALS="aes256gcm16-ecp384,aes256gcm16-ecp256,aes256gcm16-modp2048,aes256gcm16,aes256-sha256-modp2048,aes256-sha256"
 APPLE_REKEY_ESP_PROPOSALS="aes256gcm16-ecp256,aes256gcm16-modp2048,aes256gcm16"
 DEFAULT_LOCAL_TS="0.0.0.0/0"
+# Hairpinned client-to-client traffic is dropped unless explicitly disabled.
+DEFAULT_CLIENT_ISOLATION="1"
+# Inbound hardening appends a default-drop allowlist chain to INPUT.
+DEFAULT_HARDEN_INPUT="0"
 
 trap 'LAST_ERROR="Command failed on line $LINENO"' ERR
 
@@ -107,6 +111,10 @@ load_config() {
   ESP_PROPOSALS="${ESP_PROPOSALS:-$DEFAULT_ESP_PROPOSALS}"
   ESP_PROPOSALS="$(ensure_apple_esp_proposals "$ESP_PROPOSALS")"
   LOCAL_TS="${LOCAL_TS:-$DEFAULT_LOCAL_TS}"
+  CLIENT_ISOLATION="${CLIENT_ISOLATION:-$DEFAULT_CLIENT_ISOLATION}"
+  HARDEN_INPUT="${HARDEN_INPUT:-$DEFAULT_HARDEN_INPUT}"
+  HARDEN_TCP_PORTS="${HARDEN_TCP_PORTS:-}"
+  HARDEN_UDP_PORTS="${HARDEN_UDP_PORTS:-}"
   UPLINK_IF="${UPLINK_IF:-$(detect_uplink_if || true)}"
   UPLINK_IF="${UPLINK_IF:-}"
   INSTALLED="${INSTALLED:-0}"
@@ -139,6 +147,10 @@ save_config() {
     printf 'IKE_PROPOSALS=%q\n' "${IKE_PROPOSALS:-}"
     printf 'ESP_PROPOSALS=%q\n' "${ESP_PROPOSALS:-}"
     printf 'LOCAL_TS=%q\n' "${LOCAL_TS:-}"
+    printf 'CLIENT_ISOLATION=%q\n' "${CLIENT_ISOLATION:-}"
+    printf 'HARDEN_INPUT=%q\n' "${HARDEN_INPUT:-}"
+    printf 'HARDEN_TCP_PORTS=%q\n' "${HARDEN_TCP_PORTS:-}"
+    printf 'HARDEN_UDP_PORTS=%q\n' "${HARDEN_UDP_PORTS:-}"
   } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
@@ -366,6 +378,33 @@ valid_range() {
   (($(ip_to_int "$start") <= $(ip_to_int "$end")))
 }
 
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# Comma/space separated TCP/UDP port list; empty input is valid (no ports).
+valid_port_list() {
+  local list="$1" port
+  list="${list//,/ }"
+  for port in $list; do
+    valid_port "$port" || return 1
+  done
+}
+
+# Canonical form: comma-separated, duplicates removed, original order kept.
+normalize_port_list() {
+  local list="$1" port out=""
+  list="${list//,/ }"
+  for port in $list; do
+    case ",$out," in
+      *",$port,"*) ;;
+      *) out+="${out:+,}$port" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 valid_domain_name() {
   local d="$1" label
   local labels=()
@@ -511,6 +550,18 @@ has_forward_rule_out() {
 has_forward_rule_in() {
   [[ -n "${UPLINK_IF:-}" ]] || return 1
   iptables -C FORWARD -d "$VPN_POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1
+}
+
+has_mss_clamp_rule() {
+  iptables -t mangle -C FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1
+}
+
+has_isolation_rule() {
+  iptables -C FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP >/dev/null 2>&1
+}
+
+has_harden_chain() {
+  iptables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1
 }
 
 status_line() {
@@ -733,6 +784,11 @@ set -Eeuo pipefail
 POOL_CIDR='${VPN_POOL_CIDR}'
 POOL6_CIDR='${VPN_POOL6_CIDR}'
 UPLINK_IF='${UPLINK_IF}'
+CLIENT_ISOLATION='${CLIENT_ISOLATION:-1}'
+HARDEN_INPUT='${HARDEN_INPUT:-0}'
+HARDEN_TCP_PORTS='${HARDEN_TCP_PORTS}'
+HARDEN_UDP_PORTS='${HARDEN_UDP_PORTS}'
+HARDEN_CHAIN='IKEV2_MGR_IN'
 
 # IKEv2 server ports. External NAT/security-group rules still have to allow UDP/500 and UDP/4500.
 iptables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1 || \
@@ -747,6 +803,24 @@ iptables -C FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 
   iptables -I FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT
 iptables -C FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
   iptables -I FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT
+
+# Clamp TCP MSS to path MTU for tunneled clients: native IKEv2 clients have
+# no MSS help from their side, large packets blackhole without this.
+iptables -t mangle -C FORWARD -s "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
+  iptables -t mangle -A FORWARD -s "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t mangle -C FORWARD -d "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
+  iptables -t mangle -A FORWARD -d "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# Hairpinned client-to-client traffic; inserted last so it lands above the
+# pool ACCEPT rules.
+if [[ "\$CLIENT_ISOLATION" == "1" ]]; then
+  iptables -C FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP >/dev/null 2>&1 || \
+    iptables -I FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP
+else
+  while iptables -C FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP >/dev/null 2>&1; do
+    iptables -D FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP || break
+  done
+fi
 EOF_FW
 
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
@@ -769,6 +843,20 @@ EOF_FW6_IN
     ip6tables -I FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
   ip6tables -C FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
     ip6tables -I FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
+
+  ip6tables -t mangle -C FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
+    ip6tables -t mangle -A FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  ip6tables -t mangle -C FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
+    ip6tables -t mangle -A FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+  if [[ "$CLIENT_ISOLATION" == "1" ]]; then
+    ip6tables -C FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP >/dev/null 2>&1 || \
+      ip6tables -I FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP
+  else
+    while ip6tables -C FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP >/dev/null 2>&1; do
+      ip6tables -D FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP || break
+    done
+  fi
 fi
 EOF_FW6_NAT
     else
@@ -781,6 +869,72 @@ fi
 EOF_FW6_BLOCK
     fi
   fi
+
+  cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_HARDEN'
+
+# Inbound hardening: a default-drop allowlist chain appended to INPUT.
+# SSH ports are detected at run time so a changed sshd_config cannot cause
+# a lockout; IKEv2, ESP, ICMP and explicitly listed ports stay reachable.
+harden_tools=(iptables)
+if command -v ip6tables >/dev/null 2>&1; then
+  harden_tools+=(ip6tables)
+fi
+
+if [[ "$HARDEN_INPUT" == "1" ]]; then
+  ssh_ports="$({
+    awk '$1 == "Port" { print $2 }' \
+      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+    ss -Hlntp 2>/dev/null | awk '/"sshd"/ { sub(/.*:/, "", $4); print $4 }'
+  } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+  [[ -n "${ssh_ports// /}" ]] || ssh_ports="22"
+
+  mt_port=""
+  if [[ -f /etc/mtproxy-manager/config ]]; then
+    mt_port="$(sed -n 's/^MT_PORT="\([0-9]*\)"$/\1/p' /etc/mtproxy-manager/config | head -n1 || true)"
+  fi
+
+  for ipt in "${harden_tools[@]}"; do
+    "$ipt" -N "$HARDEN_CHAIN" 2>/dev/null || true
+    "$ipt" -F "$HARDEN_CHAIN"
+    "$ipt" -A "$HARDEN_CHAIN" -i lo -j ACCEPT
+    "$ipt" -A "$HARDEN_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    if [[ "$ipt" == "ip6tables" ]]; then
+      # ICMPv6 carries neighbor discovery and RA; DHCPv6 keeps the uplink lease.
+      "$ipt" -A "$HARDEN_CHAIN" -p ipv6-icmp -j ACCEPT
+      "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 546 -j ACCEPT
+    else
+      "$ipt" -A "$HARDEN_CHAIN" -p icmp -j ACCEPT
+    fi
+    "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 500 -j ACCEPT
+    "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 4500 -j ACCEPT
+    # Non-NAT peers run plain ESP instead of UDP encapsulation.
+    "$ipt" -A "$HARDEN_CHAIN" -p esp -j ACCEPT
+    for port in $ssh_ports; do
+      "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport "$port" -j ACCEPT
+    done
+    if [[ -n "$mt_port" ]]; then
+      "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport "$mt_port" -j ACCEPT
+    fi
+    for port in ${HARDEN_TCP_PORTS//,/ }; do
+      "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport "$port" -j ACCEPT
+    done
+    for port in ${HARDEN_UDP_PORTS//,/ }; do
+      "$ipt" -A "$HARDEN_CHAIN" -p udp --dport "$port" -j ACCEPT
+    done
+    "$ipt" -A "$HARDEN_CHAIN" -j DROP
+    "$ipt" -C INPUT -j "$HARDEN_CHAIN" >/dev/null 2>&1 || \
+      "$ipt" -A INPUT -j "$HARDEN_CHAIN"
+  done
+else
+  for ipt in "${harden_tools[@]}"; do
+    while "$ipt" -C INPUT -j "$HARDEN_CHAIN" >/dev/null 2>&1; do
+      "$ipt" -D INPUT -j "$HARDEN_CHAIN" || break
+    done
+    "$ipt" -F "$HARDEN_CHAIN" 2>/dev/null || true
+    "$ipt" -X "$HARDEN_CHAIN" 2>/dev/null || true
+  done
+fi
+EOF_FW_HARDEN
 
   cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_SAVE'
 
@@ -845,6 +999,21 @@ remove_firewall_rules() {
     done
   fi
 
+  while iptables -t mangle -C FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
+    iptables -t mangle -D FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
+  done
+  while iptables -t mangle -C FORWARD -d "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
+    iptables -t mangle -D FORWARD -d "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
+  done
+  while iptables -C FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP >/dev/null 2>&1; do
+    iptables -D FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP || break
+  done
+  while iptables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1; do
+    iptables -D INPUT -j IKEV2_MGR_IN || break
+  done
+  iptables -F IKEV2_MGR_IN 2>/dev/null || true
+  iptables -X IKEV2_MGR_IN 2>/dev/null || true
+
   if command -v ip6tables >/dev/null 2>&1; then
     while ip6tables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1; do
       ip6tables -D INPUT -p udp --dport 500 -j ACCEPT || break
@@ -868,7 +1037,21 @@ remove_firewall_rules() {
           ip6tables -D FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT || break
         done
       fi
+      while ip6tables -t mangle -C FORWARD -s "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
+        ip6tables -t mangle -D FORWARD -s "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
+      done
+      while ip6tables -t mangle -C FORWARD -d "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
+        ip6tables -t mangle -D FORWARD -d "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
+      done
+      while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -d "$VPN_POOL6_CIDR" -j DROP >/dev/null 2>&1; do
+        ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -d "$VPN_POOL6_CIDR" -j DROP || break
+      done
     fi
+    while ip6tables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1; do
+      ip6tables -D INPUT -j IKEV2_MGR_IN || break
+    done
+    ip6tables -F IKEV2_MGR_IN 2>/dev/null || true
+    ip6tables -X IKEV2_MGR_IN 2>/dev/null || true
   fi
 
   if [[ -f "$FIREWALL_SERVICE" ]]; then
@@ -974,7 +1157,9 @@ uninstall_cleanup() {
 
 ensure_kernel_ipsec_support() {
   local required_modules=(xfrm_user esp4)
-  local optional_modules=(af_key ah4 xfrm4_tunnel rfc4106 gcm aes aesni_intel)
+  # esp6/xfrm6_tunnel cover IKE over IPv6 and ESP-in-UDP over IPv6; a missing
+  # module surfaces as netlink "Protocol not supported" on CHILD_SA install.
+  local optional_modules=(af_key ah4 xfrm4_tunnel esp6 xfrm6_tunnel rfc4106 gcm aes aesni_intel)
   local module failed=0 output
 
   if command -v modprobe >/dev/null 2>&1; then
@@ -1327,6 +1512,25 @@ validate_install_inputs() {
     echo "VPN DNS is invalid. Use IP addresses separated by commas."
     return 1
   }
+
+  [[ "$CLIENT_ISOLATION" == "0" || "$CLIENT_ISOLATION" == "1" ]] || {
+    echo "Client isolation must be 0 or 1."
+    return 1
+  }
+  [[ "$HARDEN_INPUT" == "0" || "$HARDEN_INPUT" == "1" ]] || {
+    echo "Inbound hardening must be 0 or 1."
+    return 1
+  }
+  valid_port_list "$HARDEN_TCP_PORTS" || {
+    echo "Extra TCP port list is invalid."
+    return 1
+  }
+  valid_port_list "$HARDEN_UDP_PORTS" || {
+    echo "Extra UDP port list is invalid."
+    return 1
+  }
+  HARDEN_TCP_PORTS=$(normalize_port_list "$HARDEN_TCP_PORTS")
+  HARDEN_UDP_PORTS=$(normalize_port_list "$HARDEN_UDP_PORTS")
 }
 install_wizard() {
   render_header
@@ -1374,6 +1578,21 @@ install_wizard() {
   if [[ "$IPV6_MODE" != "off" ]]; then
     VPN_POOL6_CIDR=$(ask "VPN IPv6 pool (CIDR)" "${VPN_POOL6_CIDR:-$DEFAULT_POOL6_CIDR}")
   fi
+
+  echo
+  echo "Inbound hardening appends a default-drop allowlist to INPUT:"
+  echo "only loopback, ICMP, IKEv2/ESP, SSH, MTProxy and the extra ports"
+  echo "listed below stay reachable. Anything else (panels, agents, etc.)"
+  echo "must be listed explicitly or it becomes unreachable from outside."
+  HARDEN_INPUT=$(ask "Enable inbound hardening (1/0)" "${HARDEN_INPUT:-$DEFAULT_HARDEN_INPUT}")
+  if [[ "$HARDEN_INPUT" == "1" ]]; then
+    echo
+    echo "Currently listening sockets (for reference):"
+    ss -Hlntu 2>/dev/null | awk '{ print $1, $5 }' | sort -u | head -n 20 || true
+    HARDEN_TCP_PORTS=$(ask "Extra allowed inbound TCP ports (comma-separated, empty for none)" "${HARDEN_TCP_PORTS:-}")
+    HARDEN_UDP_PORTS=$(ask "Extra allowed inbound UDP ports (comma-separated, empty for none)" "${HARDEN_UDP_PORTS:-}")
+  fi
+  CLIENT_ISOLATION=$(ask "Drop VPN client-to-client traffic (1/0)" "${CLIENT_ISOLATION:-1}")
 
   if [[ "$ACME_MODE" == "http-01" ]]; then
     echo
@@ -2939,6 +3158,7 @@ show_diagnostics() {
   if command -v lsmod >/dev/null 2>&1; then
     echo "xfrm_user:     $(lsmod | awk '{print $1}' | grep -qx xfrm_user && echo loaded || echo missing)"
     echo "esp4:          $(lsmod | awk '{print $1}' | grep -qx esp4 && echo loaded || echo missing)"
+    echo "esp6:          $(lsmod | awk '{print $1}' | grep -qx esp6 && echo loaded || echo missing)"
     echo "rfc4106/gcm:   $(lsmod | awk '{print $1}' | grep -Eq '^(rfc4106|gcm)$' && echo loaded || echo missing)"
   fi
   echo
@@ -2956,6 +3176,9 @@ show_diagnostics() {
   echo "NAT rule:      $(has_nat_rule && echo yes || echo no)"
   echo "Forward out:   $(has_forward_rule_out && echo yes || echo no)"
   echo "Forward in:    $(has_forward_rule_in && echo yes || echo no)"
+  echo "MSS clamp:     $(has_mss_clamp_rule && echo yes || echo no)"
+  echo "Isolation:     $(has_isolation_rule && echo yes || echo no) (configured: ${CLIENT_ISOLATION:-1})"
+  echo "Hardening:     $(has_harden_chain && echo active || echo off) (configured: ${HARDEN_INPUT:-0})"
   echo
   echo "Recent VPN log"
   echo "--------------"
@@ -2992,6 +3215,66 @@ reapply_firewall() {
     return 1
   fi
   echo "Firewall rules reapplied."
+  pause
+}
+
+firewall_hardening_menu() {
+  render_header
+  echo "Inbound hardening / client isolation"
+  echo "------------------------------------"
+  echo "Hardening:      ${HARDEN_INPUT:-0} (1 = drop unlisted inbound traffic)"
+  echo "Extra TCP:      ${HARDEN_TCP_PORTS:-none}"
+  echo "Extra UDP:      ${HARDEN_UDP_PORTS:-none}"
+  echo "Isolation:      ${CLIENT_ISOLATION:-1} (1 = drop client-to-client)"
+  echo
+  echo "SSH, ICMP, IKEv2/ESP and the MTProxy port are always allowed."
+  echo
+
+  local harden tcp_ports udp_ports isolation
+  harden=$(ask "Enable inbound hardening (1/0)" "${HARDEN_INPUT:-0}")
+  [[ "$harden" == "0" || "$harden" == "1" ]] || {
+    echo "Inbound hardening must be 0 or 1."
+    pause
+    return 1
+  }
+  tcp_ports="${HARDEN_TCP_PORTS:-}"
+  udp_ports="${HARDEN_UDP_PORTS:-}"
+  if [[ "$harden" == "1" ]]; then
+    echo
+    echo "Currently listening sockets (for reference):"
+    ss -Hlntu 2>/dev/null | awk '{ print $1, $5 }' | sort -u | head -n 20 || true
+    tcp_ports=$(ask "Extra allowed inbound TCP ports (comma-separated, empty for none)" "$tcp_ports")
+    udp_ports=$(ask "Extra allowed inbound UDP ports (comma-separated, empty for none)" "$udp_ports")
+    valid_port_list "$tcp_ports" || {
+      echo "Extra TCP port list is invalid."
+      pause
+      return 1
+    }
+    valid_port_list "$udp_ports" || {
+      echo "Extra UDP port list is invalid."
+      pause
+      return 1
+    }
+  fi
+  isolation=$(ask "Drop VPN client-to-client traffic (1/0)" "${CLIENT_ISOLATION:-1}")
+  [[ "$isolation" == "0" || "$isolation" == "1" ]] || {
+    echo "Client isolation must be 0 or 1."
+    pause
+    return 1
+  }
+
+  HARDEN_INPUT="$harden"
+  HARDEN_TCP_PORTS=$(normalize_port_list "$tcp_ports")
+  HARDEN_UDP_PORTS=$(normalize_port_list "$udp_ports")
+  CLIENT_ISOLATION="$isolation"
+  save_config
+
+  if ! apply_firewall_rules; then
+    echo "Failed to apply firewall rules."
+    pause
+    return 1
+  fi
+  echo "Firewall rules applied."
   pause
 }
 
@@ -3079,10 +3362,11 @@ service_tools_menu() {
     echo "------------"
     menu_item 1 "Reissue certificate"
     menu_item 2 "Reapply firewall rules"
-    menu_item 3 "Show diagnostics"
-    menu_item 4 "Show logs"
-    menu_item 5 "Show client info"
-    menu_item 6 "Uninstall / cleanup"
+    menu_item 3 "Inbound hardening / client isolation"
+    menu_item 4 "Show diagnostics"
+    menu_item 5 "Show logs"
+    menu_item 6 "Show client info"
+    menu_item 7 "Uninstall / cleanup"
     echo
     menu_enter_hint "Back"
     echo
@@ -3090,10 +3374,11 @@ service_tools_menu() {
     case "$choice" in
       1) reissue_certificate ;;
       2) reapply_firewall ;;
-      3) show_diagnostics ;;
-      4) show_recent_logs ;;
-      5) show_client_info ;;
-      6) uninstall_cleanup ;;
+      3) firewall_hardening_menu ;;
+      4) show_diagnostics ;;
+      5) show_recent_logs ;;
+      6) show_client_info ;;
+      7) uninstall_cleanup ;;
       "" | 0) return 0 ;;
       *) invalid_choice ;;
     esac
