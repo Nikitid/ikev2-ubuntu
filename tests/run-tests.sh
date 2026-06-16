@@ -144,6 +144,19 @@ assert_eq "ensure_apple_esp_proposals strips spaces and avoids duplicates" \
   "aes256gcm16,aes256gcm16-ecp256,aes256gcm16-modp2048" \
   "$(ensure_apple_esp_proposals "aes256gcm16, aes256gcm16-ecp256")"
 
+# valid_port / valid_port_list / normalize_port_list
+assert_ok "valid_port accepts 22" valid_port "22"
+assert_ok "valid_port accepts 65535" valid_port "65535"
+assert_fail "valid_port rejects 0" valid_port "0"
+assert_fail "valid_port rejects 65536" valid_port "65536"
+assert_fail "valid_port rejects letters" valid_port "ssh"
+assert_ok "valid_port_list accepts empty" valid_port_list ""
+assert_ok "valid_port_list accepts commas and spaces" valid_port_list "443, 8443 2001"
+assert_fail "valid_port_list rejects bad member" valid_port_list "443,bad"
+assert_eq "normalize_port_list canonicalizes" "443,8443,2001" "$(normalize_port_list "443, 8443 2001")"
+assert_eq "normalize_port_list dedupes" "443" "$(normalize_port_list "443,443")"
+assert_eq "normalize_port_list empty" "" "$(normalize_port_list "")"
+
 # valid_domain_name
 assert_ok "valid_domain_name accepts vpn.example.com" valid_domain_name "vpn.example.com"
 assert_fail "valid_domain_name rejects single label" valid_domain_name "example"
