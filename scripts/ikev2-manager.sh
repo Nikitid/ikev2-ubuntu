@@ -68,6 +68,7 @@ DEFAULT_ACME_MODE="dns-01"
 DEFAULT_DPD_DELAY="30s"
 DEFAULT_IKE_PROPOSALS="aes256gcm16-prfsha384-ecp384,aes256-sha256-modp2048"
 DEFAULT_ESP_PROPOSALS="aes256gcm16-ecp384,aes256gcm16-ecp256,aes256gcm16-modp2048,aes256gcm16,aes256-sha256-modp2048,aes256-sha256"
+APPLE_REKEY_ESP_PROPOSALS="aes256gcm16-ecp256,aes256gcm16-modp2048,aes256gcm16"
 DEFAULT_LOCAL_TS="0.0.0.0/0"
 
 trap 'LAST_ERROR="Command failed on line $LINENO"' ERR
@@ -104,6 +105,7 @@ load_config() {
   DPD_DELAY="${DPD_DELAY:-$DEFAULT_DPD_DELAY}"
   IKE_PROPOSALS="${IKE_PROPOSALS:-$DEFAULT_IKE_PROPOSALS}"
   ESP_PROPOSALS="${ESP_PROPOSALS:-$DEFAULT_ESP_PROPOSALS}"
+  ESP_PROPOSALS="$(ensure_apple_esp_proposals "$ESP_PROPOSALS")"
   LOCAL_TS="${LOCAL_TS:-$DEFAULT_LOCAL_TS}"
   UPLINK_IF="${UPLINK_IF:-$(detect_uplink_if || true)}"
   UPLINK_IF="${UPLINK_IF:-}"
@@ -203,10 +205,11 @@ detect_default_dns() {
 
 normalize_dns_list() {
   local input="$1" out="" part keep
+  local -a __parts=()
   input="${input// /}"
   input="${input//;/,}"
   while IFS=',' read -r -a __parts; do
-    for part in "${__parts[@]}"; do
+    for part in "${__parts[@]+"${__parts[@]}"}"; do
       keep=0
       # Loopback and unspecified addresses are useless as client DNS.
       if [[ "$part" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && ! "$part" =~ ^(127\.|0\.) ]]; then
@@ -227,6 +230,31 @@ normalize_dns_list() {
     break
   done <<<"$input"
   echo "$out"
+}
+
+csv_list_contains() {
+  local list="${1// /}" item="$2"
+  case ",$list," in
+    *",$item,"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+append_missing_csv_items() {
+  local list="${1// /}" required="$2" item
+  local IFS=','
+  for item in $required; do
+    [[ -n "$item" ]] || continue
+    if ! csv_list_contains "$list" "$item"; then
+      list+="${list:+,}$item"
+    fi
+  done
+  printf '%s' "$list"
+}
+
+ensure_apple_esp_proposals() {
+  local proposals="${1:-$DEFAULT_ESP_PROPOSALS}"
+  append_missing_csv_items "$proposals" "$APPLE_REKEY_ESP_PROPOSALS"
 }
 
 # Drop IPv6 resolvers from a comma-separated DNS list; they are unreachable
@@ -282,7 +310,10 @@ valid_ipv6() {
     local -a hg=() tg=()
     [[ -n "$head" ]] && IFS=':' read -r -a hg <<<"$head"
     [[ -n "$tail" ]] && IFS=':' read -r -a tg <<<"$tail"
-    for g in "${hg[@]}" "${tg[@]}"; do
+    for g in "${hg[@]+"${hg[@]}"}"; do
+      [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    done
+    for g in "${tg[@]+"${tg[@]}"}"; do
       [[ "$g" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
     done
     ((${#hg[@]} + ${#tg[@]} <= 7))
@@ -384,7 +415,8 @@ infer_group_from_username() {
 }
 
 normalize_platform() {
-  local p="${1,,}"
+  local p
+  p=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   case "$p" in
     win | windows | pc) echo "windows" ;;
     iphone | ios | ipad | phone) echo "ios" ;;
@@ -1004,6 +1036,7 @@ escape_swanctl() {
 
 generate_swanctl_conf() {
   migrate_users_db
+  ESP_PROPOSALS="$(ensure_apple_esp_proposals "$ESP_PROPOSALS")"
   mkdir -p /etc/swanctl /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
   backup_file "$SWANCTL_CONF"
 

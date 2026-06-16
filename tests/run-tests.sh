@@ -133,6 +133,17 @@ assert_eq "normalize_dns_list drops unspecified" "9.9.9.9" "$(normalize_dns_list
 assert_eq "normalize_dns_list drops junk" "8.8.4.4" "$(normalize_dns_list "not-an-ip,8.8.4.4")"
 assert_eq "normalize_dns_list empty input" "" "$(normalize_dns_list "")"
 
+# ensure_apple_esp_proposals
+assert_eq "ensure_apple_esp_proposals migrates old server set" \
+  "aes256gcm16-ecp384,aes256-sha256,aes256gcm16-ecp256,aes256gcm16-modp2048,aes256gcm16" \
+  "$(ensure_apple_esp_proposals "aes256gcm16-ecp384,aes256-sha256")"
+assert_eq "ensure_apple_esp_proposals keeps complete default unchanged" \
+  "$DEFAULT_ESP_PROPOSALS" \
+  "$(ensure_apple_esp_proposals "$DEFAULT_ESP_PROPOSALS")"
+assert_eq "ensure_apple_esp_proposals strips spaces and avoids duplicates" \
+  "aes256gcm16,aes256gcm16-ecp256,aes256gcm16-modp2048" \
+  "$(ensure_apple_esp_proposals "aes256gcm16, aes256gcm16-ecp256")"
+
 # valid_domain_name
 assert_ok "valid_domain_name accepts vpn.example.com" valid_domain_name "vpn.example.com"
 assert_fail "valid_domain_name rejects single label" valid_domain_name "example"
