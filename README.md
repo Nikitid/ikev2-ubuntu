@@ -17,6 +17,7 @@ The script focuses on a practical single-server setup: strongSwan with `swanctl`
 - Manage VPN users with username, password, group, and platform labels
 - Export local client bundles for Windows, iOS, macOS, and Ubuntu
 - Configure IPv4 forwarding and iptables NAT rules
+- Keep ESP proposals compatible with Apple CHILD_SA rekeying (prevents periodic disconnects)
 - IPv6 modes: leak protection (default), full IPv6 via NAT66, or IPv4-only
 - Reapply firewall rules and reissue certificates from the menu
 - Show service status, diagnostics, recent logs, and client info
@@ -59,6 +60,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.0.1
 - Exported client bundles under `/opt/ikev2-manager/exports` contain plaintext credentials; treat them as secrets when copying off the server.
 - VPN configuration is generated at `/etc/swanctl/swanctl.conf`.
 - Firewall rules are applied through iptables and persisted when `iptables-save` is available.
+- Existing installs with older ESP proposal lists are automatically expanded with Apple-compatible rekey proposals when the manager reloads configuration.
 
 ## Development
 
