@@ -1,4 +1,4 @@
-# IKEv2 Manager
+# IKEv2 Manager for Ubuntu
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Build](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=build)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
