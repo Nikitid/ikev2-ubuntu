@@ -1,62 +1,65 @@
 # IKEv2 Manager for Ubuntu
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Build](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=build)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
-[![ShellCheck](https://img.shields.io/github/actions/workflow/status/Nikitid/ikev2-manager/check.yml?branch=main&label=shellcheck)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
+[English](README.en.md)
 
-Interactive Bash manager for deploying and maintaining an IKEv2/IPsec VPN server on Ubuntu.
+[![Лицензия: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Проверки](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml/badge.svg)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
 
-It installs and manages a practical single-server setup based on strongSwan with `swanctl`, ACME certificates, EAP-MSCHAPv2 users, firewall/NAT rules, and local client bundle export.
+Интерактивный Bash-скрипт для установки и обслуживания IKEv2/IPsec-сервера
+на Ubuntu. Проект рассчитан на один сервер и использует strongSwan с
+`swanctl`, сертификаты ACME, пользователей EAP-MSCHAPv2 и правила
+межсетевого экрана.
 
-## Features
+## Состояние
 
-- IKEv2 server install, reinstall, and cleanup
-- strongSwan / `swanctl` configuration
-- ACME certificates through `acme.sh`
-- `dns-01` and `http-01` certificate validation
-- VPN users with username, password, group, and platform labels
-- Local client bundles for Windows, iOS, macOS, and Ubuntu
-- IPv4 full-tunnel NAT
-- IPv6 leak protection, NAT66, or IPv4-only mode
-- Apple-compatible ESP proposals for stable CHILD_SA rekeying
-- TCP MSS clamping for tunneled traffic
-- Optional VPN client isolation
-- Optional inbound firewall hardening
-- Diagnostics, logs, service control, and certificate renewal
-- Optional MTProxy and 3x-ui management
+Поддерживаются Ubuntu 22.04 LTS и 24.04 LTS. Актуальная стабильная версия —
+`v1.2.0`.
 
-## Supported Systems
+## Возможности
 
-- Ubuntu 22.04 LTS or 24.04 LTS
-- root access
-- systemd
-- iptables
-- public domain name for the VPN server
+- установка, переустановка и удаление IKEv2-сервера;
+- выпуск сертификатов через `acme.sh` с проверкой `dns-01` или `http-01`;
+- управление VPN-пользователями и экспорт клиентских конфигураций;
+- IPv4 full tunnel, защита от утечек IPv6 или NAT66;
+- изоляция VPN-клиентов и ограничение входящего трафика;
+- диагностика, журналы, управление службами и обновление сертификатов;
+- дополнительное управление MTProxy и 3x-ui.
 
-## Install
+## Требования
 
-Latest `main`:
+- Ubuntu 22.04 LTS или 24.04 LTS;
+- права `root`;
+- systemd и iptables;
+- публичное доменное имя, указывающее на сервер.
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/scripts/ikev2-manager.sh)
-```
+## Установка
 
-Pinned release:
+Стабильный релиз:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.2.0/scripts/ikev2-manager.sh)
 ```
 
-## Notes
+Текущая ветка `main`:
 
-- Open UDP `500` and UDP `4500` in any external firewall or cloud security group.
-- For `http-01`, TCP `80` must be reachable while issuing the certificate.
-- For `dns-01`, provide the selected `acme.sh` DNS provider credentials.
-- Managed state is stored under `/opt/ikev2-manager`.
-- VPN passwords and exported client bundles contain secrets. Keep them private.
-- Existing installs with older ESP proposal lists are automatically updated for Apple rekey compatibility when configuration is regenerated.
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/scripts/ikev2-manager.sh)
+```
 
-## Development
+Перед запуском удаленного скрипта рекомендуется проверить его содержимое и
+использовать закрепленный тег релиза.
+
+## Использование и конфигурация
+
+Скрипт открывает интерактивное меню. Управляемые файлы и состояние хранятся в
+`/opt/ikev2-manager`.
+
+- UDP-порты `500` и `4500` должны быть открыты во внешнем межсетевом экране.
+- Для `http-01` во время выпуска сертификата необходим входящий TCP-порт `80`.
+- Для `dns-01` потребуются учетные данные выбранного DNS-провайдера.
+- Пароли VPN и экспортированные клиентские наборы содержат секреты.
+
+## Разработка
 
 ```bash
 bash -n scripts/ikev2-manager.sh
@@ -64,3 +67,15 @@ shellcheck scripts/ikev2-manager.sh tests/run-tests.sh
 shfmt -i 2 -bn -ci -d scripts/ikev2-manager.sh tests/run-tests.sh
 bash tests/run-tests.sh
 ```
+
+Дополнительные правила работы с репозиторием описаны в [AGENTS.md](AGENTS.md).
+
+## Безопасность
+
+Не публикуйте конфигурацию из `/opt/ikev2-manager`, пароли, сертификаты,
+закрытые ключи и клиентские наборы. Порядок сообщения об уязвимостях указан в
+[SECURITY.md](SECURITY.md).
+
+## Лицензия
+
+[MIT](LICENSE)
