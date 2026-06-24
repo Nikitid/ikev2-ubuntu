@@ -22,7 +22,7 @@ Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
 - IPv4 full tunnel, IPv6 leak protection, or NAT66;
 - optional VPN client isolation and inbound firewall restrictions;
 - diagnostics, logs, service control, and certificate renewal;
-- optional MTProxy and 3x-ui management.
+- optional MTProto proxy management ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT) and 3x-ui.
 
 ## Requirements
 
