@@ -11,18 +11,17 @@ ACME_ENV_FILE="$MANAGER_DIR/acme.env"
 USERS_DB="$MANAGER_DIR/users.db"
 EXPORTS_DIR="$MANAGER_DIR/exports"
 
-# MTProxy manager paths
-MT_SERVICE="mtproxy"
-MT_INSTALL_DIR="/opt/MTProxy"
-MT_STATE_DIR="/etc/mtproxy-manager"
-MT_CONFIG_FILE="$MT_STATE_DIR/config"
-MT_SECRET_FILE="$MT_STATE_DIR/secret"
+# MTProto proxy manager paths
+# Backend: mtproto.zig by Aleksandr Kalashnikov (sleep3r)
+# Source:  https://github.com/sleep3r/mtproto.zig  License: MIT
+MT_SERVICE="mtproto-proxy"
+MT_BUDDY_BIN="/usr/local/bin/mtbuddy"
+MT_INSTALL_DIR="/opt/mtproto-proxy"
+MT_CONFIG_FILE="${MT_INSTALL_DIR}/config.toml"
 MT_SERVICE_FILE="/etc/systemd/system/${MT_SERVICE}.service"
-MT_SYSCTL_FILE="/etc/sysctl.d/99-mtproxy.conf"
 MT_DEFAULT_PORT="443"
-MT_DEFAULT_INTERNAL_PORT="8888"
-MT_DEFAULT_TLS_DOMAIN="www.google.com"
-MT_PID_MAX_LIMIT="65535"
+MT_DEFAULT_TLS_DOMAIN="rutube.ru"
+MT_BOOTSTRAP_URL="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
 
 # 3x-ui paths
 XUI_SERVICE="x-ui"
@@ -617,7 +616,7 @@ render_header() {
     status_line "Install status:" "$install_state"
     status_line "OS:" "$os_state"
     status_line "Topology hint:" "$topology_state"
-    status_line "MTProxy:" "$(mt_service_status)"
+    status_line "MTProto proxy:" "$(mt_service_status)"
     status_line "3x-ui:" "$(xui_status)"
     echo
     if [[ -n "$LAST_ERROR" ]]; then
@@ -665,7 +664,7 @@ render_header() {
   status_line "Auth:" "$auth_state"
   status_line "Pool / DNS:" "$quick_state"
   status_line "IPv6 mode:" "${IPV6_MODE:-off}"
-  status_line "MTProxy:" "$(mt_service_status)"
+  status_line "MTProto proxy:" "$(mt_service_status)"
   status_line "3x-ui:" "$(xui_status)"
   echo
   if [[ -n "$LAST_ERROR" ]]; then
@@ -889,8 +888,10 @@ if [[ "$HARDEN_INPUT" == "1" ]]; then
   [[ -n "${ssh_ports// /}" ]] || ssh_ports="22"
 
   mt_port=""
-  if [[ -f /etc/mtproxy-manager/config ]]; then
-    mt_port="$(sed -n 's/^MT_PORT="\([0-9]*\)"$/\1/p' /etc/mtproxy-manager/config | head -n1 || true)"
+  if [[ -f /opt/mtproto-proxy/config.toml ]]; then
+    mt_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} \
+      f && /port[[:space:]]*=/{gsub(/[^0-9]/,"",$0); print; exit}' \
+      /opt/mtproto-proxy/config.toml 2>/dev/null || true)"
   fi
 
   for ipt in "${harden_tools[@]}"; do
@@ -1581,7 +1582,7 @@ install_wizard() {
 
   echo
   echo "Inbound hardening appends a default-drop allowlist to INPUT:"
-  echo "only loopback, ICMP, IKEv2/ESP, SSH, MTProxy and the extra ports"
+  echo "only loopback, ICMP, IKEv2/ESP, SSH, MTProto proxy and the extra ports"
   echo "listed below stay reachable. Anything else (panels, agents, etc.)"
   echo "must be listed explicitly or it becomes unreachable from outside."
   HARDEN_INPUT=$(ask "Enable inbound hardening (1/0)" "${HARDEN_INPUT:-$DEFAULT_HARDEN_INPUT}")
@@ -2228,83 +2229,63 @@ EOF_WINPS
   pause
 }
 
-# ------------------------- MTProxy manager -------------------------
-mt_init_dirs() {
-  mkdir -p "$MT_STATE_DIR"
-  chmod 700 "$MT_STATE_DIR"
-}
+# ------------------------- MTProto proxy manager -------------------------
+# Backend: mtproto.zig — a lightweight Telegram proxy in Zig with FakeTLS.
+# Source:  https://github.com/sleep3r/mtproto.zig
+# Author:  Aleksandr Kalashnikov (sleep3r)
+# License: MIT — copyright notice preserved in comments and documentation.
+#
+# The proxy is installed and managed via the mtbuddy CLI downloaded from the
+# project's GitHub releases. The TLS impersonation domain (tls_domain) is
+# permanent after installation; changing it requires a full reinstall and
+# invalidates all distributed tg:// links.
 
 mt_is_installed() {
-  [[ -d "$MT_INSTALL_DIR" && -f "$MT_SERVICE_FILE" ]]
+  [[ -x "$MT_BUDDY_BIN" && -d "$MT_INSTALL_DIR" && -f "$MT_SERVICE_FILE" ]]
 }
 
 mt_require_installed() {
   if ! mt_is_installed; then
-    echo -e "${RED}MTProxy is not installed${NC}"
+    echo -e "${RED}MTProto proxy is not installed${NC}"
     sleep 2
     return 1
   fi
 }
 
-mt_load_from_service() {
-  local exec_line parsed_mt_port parsed_internal_port parsed_tls_domain
-  [[ -f "$MT_SERVICE_FILE" ]] || return 0
-
-  exec_line="$(sed -n 's/^ExecStart=//p' "$MT_SERVICE_FILE" | head -n1)"
-  [[ -n "$exec_line" ]] || return 0
-
-  parsed_mt_port="$(sed -n 's/.* -H \([0-9]\+\)\>.*/\1/p' <<<"$exec_line" | head -n1)"
-  parsed_internal_port="$(sed -n 's/.* -p \([0-9]\+\)\>.*/\1/p' <<<"$exec_line" | head -n1)"
-  parsed_tls_domain="$(sed -n 's/.* -D \([^ ]\+\)\>.*/\1/p' <<<"$exec_line" | head -n1)"
-
-  [[ -n "$parsed_mt_port" ]] && MT_PORT="$parsed_mt_port"
-  [[ -n "$parsed_internal_port" ]] && MT_INTERNAL_PORT="$parsed_internal_port"
-  [[ -n "$parsed_tls_domain" ]] && MT_TLS_DOMAIN="$parsed_tls_domain"
-}
-
 mt_load_config() {
   MT_PORT="$MT_DEFAULT_PORT"
-  MT_INTERNAL_PORT="$MT_DEFAULT_INTERNAL_PORT"
   MT_TLS_DOMAIN="$MT_DEFAULT_TLS_DOMAIN"
   MT_SECRET=""
 
-  if [[ -f "$MT_CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$MT_CONFIG_FILE"
-  else
-    mt_load_from_service
-  fi
+  [[ -f "$MT_CONFIG_FILE" ]] || return 0
 
-  if [[ -f "$MT_SECRET_FILE" ]]; then
-    MT_SECRET="$(tr -d '\r\n' <"$MT_SECRET_FILE")"
-  fi
+  local raw_port raw_domain
+  raw_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} f && /port[[:space:]]*=/ \
+    {gsub(/[^0-9]/,"",$0); print; exit}' \
+    "$MT_CONFIG_FILE" 2>/dev/null || true)"
+  [[ -n "$raw_port" ]] && MT_PORT="$raw_port"
+
+  raw_domain="$(awk '/^\[censorship\]/{f=1;next} /^\[/{f=0} \
+    f && /tls_domain[[:space:]]*=/ \
+    {sub(/.*=[[:space:]]*/,""); sub(/[[:space:]]*#.*/,""); gsub(/"/,""); print; exit}' \
+    "$MT_CONFIG_FILE" 2>/dev/null || true)"
+  [[ -n "$raw_domain" ]] && MT_TLS_DOMAIN="$raw_domain"
+
+  MT_SECRET="$(awk '/^\[access\.users\]/{f=1;next} /^\[/{f=0} \
+    f && /=[[:space:]]*"/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/".*/,""); print; exit}' \
+    "$MT_CONFIG_FILE" 2>/dev/null || true)"
 }
 
-mt_save_config() {
-  mt_init_dirs
-  cat >"$MT_CONFIG_FILE" <<EOF_MTCONF
-MT_PORT="$MT_PORT"
-MT_INTERNAL_PORT="$MT_INTERNAL_PORT"
-MT_TLS_DOMAIN="$MT_TLS_DOMAIN"
-EOF_MTCONF
-  chmod 600 "$MT_CONFIG_FILE"
+mt_validate_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  ((port >= 1 && port <= 65535)) || return 1
+  return 0
 }
 
-mt_generate_secret() {
-  head -c 16 /dev/urandom | xxd -ps | tr -d '\n'
-}
-
-mt_download_file() {
-  local url="$1" output="$2"
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$output"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$output"
-  else
-    echo -e "${RED}Neither curl nor wget is available${NC}"
-    return 1
-  fi
+mt_port_in_use() {
+  local port="$1"
+  ss -H -ltn "( sport = :${port} )" 2>/dev/null | grep -q .
 }
 
 mt_get_server_ip() {
@@ -2341,114 +2322,8 @@ mt_build_link() {
   ip="${ip:-YOUR_IP}"
 
   domain_hex="$(printf '%s' "$MT_TLS_DOMAIN" | xxd -ps -c 999 | tr -d '\n')"
-  printf 'tg://proxy?server=%s&port=%s&secret=ee%s%s\n' "$ip" "$MT_PORT" "$MT_SECRET" "$domain_hex"
-}
-
-mt_check_tls_domain() {
-  local domain="$1" tmp
-
-  tmp="$(mktemp)"
-
-  if timeout 8 openssl s_client \
-    -connect "${domain}:443" \
-    -servername "$domain" \
-    -verify_hostname "$domain" \
-    -verify_return_error \
-    </dev/null >"$tmp" 2>&1; then
-    if grep -q "Verify return code: 0 (ok)" "$tmp"; then
-      rm -f "$tmp"
-      return 0
-    fi
-  fi
-
-  rm -f "$tmp"
-  return 1
-}
-
-mt_validate_port() {
-  local port="$1"
-  [[ "$port" =~ ^[0-9]+$ ]] || return 1
-  ((port >= 1 && port <= 65535)) || return 1
-  return 0
-}
-
-mt_port_in_use() {
-  local port="$1"
-  ss -H -ltn "( sport = :${port} )" 2>/dev/null | grep -q .
-}
-
-mt_check_required_commands() {
-  local missing=()
-
-  for cmd in git make openssl timeout ss iptables systemctl xxd ip curl awk sed grep; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-      missing+=("$cmd")
-    fi
-  done
-
-  if ((${#missing[@]} > 0)); then
-    echo -e "${RED}Missing required commands:${NC} ${missing[*]}"
-    return 1
-  fi
-}
-
-mt_configure_pid_max() {
-  local current
-  current="$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 0)"
-
-  if [[ ! "$current" =~ ^[0-9]+$ ]]; then
-    return 0
-  fi
-
-  if ((current > MT_PID_MAX_LIMIT)); then
-    printf 'kernel.pid_max=%s\n' "$MT_PID_MAX_LIMIT" >"$MT_SYSCTL_FILE"
-    sysctl -q -p "$MT_SYSCTL_FILE" || true
-  fi
-}
-
-mt_show_pid_max_warning_if_needed() {
-  local current
-  current="$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 0)"
-
-  if [[ "$current" =~ ^[0-9]+$ ]] && ((current > MT_PID_MAX_LIMIT)); then
-    echo -e "${YELLOW}Warning:${NC} kernel.pid_max=${current}. MTProxy may crash with PID > ${MT_PID_MAX_LIMIT}."
-    echo -e "${YELLOW}Recommended fix:${NC} set kernel.pid_max=${MT_PID_MAX_LIMIT}"
-    echo
-  fi
-}
-
-mt_write_service() {
-  cat >"$MT_SERVICE_FILE" <<EOF_MTSVC
-[Unit]
-Description=MTProto Proxy
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${MT_INSTALL_DIR}
-ExecStartPre=/usr/bin/test -x ${MT_INSTALL_DIR}/objs/bin/mtproto-proxy
-ExecStartPre=/usr/bin/test -f ${MT_INSTALL_DIR}/proxy-secret
-ExecStartPre=/usr/bin/test -f ${MT_INSTALL_DIR}/proxy-multi.conf
-ExecStart=${MT_INSTALL_DIR}/objs/bin/mtproto-proxy -u nobody -p ${MT_INTERNAL_PORT} -H ${MT_PORT} -S ${MT_SECRET} -D ${MT_TLS_DOMAIN} --aes-pwd ${MT_INSTALL_DIR}/proxy-secret ${MT_INSTALL_DIR}/proxy-multi.conf --max-accept-rate 1000 --max-dh-accept-rate 500 --msg-buffers-size 134217728 --http-stats
-Restart=always
-RestartSec=3
-TimeoutStopSec=5
-TimeoutStartSec=20
-LimitNOFILE=100000
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
-PrivateDevices=true
-ProtectControlGroups=true
-ProtectKernelTunables=true
-
-[Install]
-WantedBy=multi-user.target
-EOF_MTSVC
-  # The unit embeds the proxy secret in ExecStart.
-  chmod 600 "$MT_SERVICE_FILE"
+  printf 'tg://proxy?server=%s&port=%s&secret=ee%s%s\n' \
+    "$ip" "$MT_PORT" "$MT_SECRET" "$domain_hex"
 }
 
 mt_service_status() {
@@ -2505,28 +2380,18 @@ mt_verify_service_started() {
     ((attempts--))
   done
 
-  echo -e "${RED}MTProxy service failed to start${NC}"
+  echo -e "${RED}MTProto proxy service failed to start${NC}"
   echo
   systemctl --no-pager --full status "${MT_SERVICE}.service" || true
   echo
   journalctl -u "${MT_SERVICE}.service" -n 30 --no-pager || true
-  echo
-  mt_show_pid_max_warning_if_needed
   return 1
 }
 
 mt_firewall_add() {
-  iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT
-
-  # The internal stats port (--http-stats) must not be reachable from outside.
-  iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null \
-    || iptables -I INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null \
-      || ip6tables -I INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP
-  fi
-
+  mt_load_config
+  iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT 2>/dev/null \
+    || iptables -I INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
   fi
@@ -2534,306 +2399,66 @@ mt_firewall_add() {
 
 mt_firewall_remove() {
   mt_load_config
-
-  while iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT 2>/dev/null; do
-    iptables -D INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproxy-manager" -j ACCEPT || break
+  while iptables -C INPUT -p tcp --dport "$MT_PORT" \
+    -m comment --comment "mtproto-manager" -j ACCEPT 2>/dev/null; do
+    iptables -D INPUT -p tcp --dport "$MT_PORT" \
+      -m comment --comment "mtproto-manager" -j ACCEPT \
+      || break
   done
-
-  while iptables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
-    iptables -D INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP || break
-  done
-
-  if command -v ip6tables >/dev/null 2>&1; then
-    while ip6tables -C INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
-      ip6tables -D INPUT -p tcp --dport "$MT_INTERNAL_PORT" ! -i lo -m comment --comment "mtproxy-manager" -j DROP || break
-    done
-  fi
-
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
   fi
 }
 
-mt_prompt_install_settings() {
-  local input_mt_port input_internal_port input_tls_domain
-
-  read -r -p "Client port [${MT_DEFAULT_PORT}]: " input_mt_port
-  read -r -p "Internal port [${MT_DEFAULT_INTERNAL_PORT}]: " input_internal_port
-  read -r -p "TLS domain [${MT_DEFAULT_TLS_DOMAIN}]: " input_tls_domain
-
-  MT_PORT="${input_mt_port:-$MT_DEFAULT_PORT}"
-  MT_INTERNAL_PORT="${input_internal_port:-$MT_DEFAULT_INTERNAL_PORT}"
-  MT_TLS_DOMAIN="${input_tls_domain:-$MT_DEFAULT_TLS_DOMAIN}"
-
-  if ! mt_validate_port "$MT_PORT"; then
-    echo -e "${RED}Invalid client port${NC}"
-    return 1
-  fi
-
-  if ! mt_validate_port "$MT_INTERNAL_PORT"; then
-    echo -e "${RED}Invalid internal port${NC}"
-    return 1
-  fi
-
-  if [[ "$MT_PORT" == "$MT_INTERNAL_PORT" ]]; then
-    echo -e "${RED}Client port and internal port must be different${NC}"
-    return 1
-  fi
-
-  if ! valid_domain_name "$MT_TLS_DOMAIN"; then
-    echo -e "${RED}Invalid TLS domain${NC}"
-    return 1
-  fi
-
-  if mt_port_in_use "$MT_PORT" && ! mt_is_installed; then
-    echo -e "${RED}Client port ${MT_PORT} is already in use${NC}"
-    return 1
-  fi
-
-  if mt_port_in_use "$MT_INTERNAL_PORT" && ! mt_is_installed; then
-    echo -e "${RED}Internal port ${MT_INTERNAL_PORT} is already in use${NC}"
-    return 1
-  fi
-
-  echo -e "${WHITE}Checking TLS domain...${NC}"
-  if ! mt_check_tls_domain "$MT_TLS_DOMAIN"; then
-    echo -e "${RED}Invalid TLS domain or certificate chain verification failed${NC}"
-    return 1
-  fi
-}
-
-mt_install_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y \
-    git curl wget build-essential libssl-dev zlib1g-dev \
-    ca-certificates openssl xxd iptables iptables-persistent iproute2
-}
-
-mt_install() {
-  render_header
-  echo -e "${CYAN}Installing MTProxy...${NC}"
-  echo
-
-  mt_load_config
-  mt_prompt_install_settings || {
-    sleep 2
-    return 1
-  }
-
-  mt_install_packages
-  mt_check_required_commands || {
-    sleep 2
-    return 1
-  }
-  mt_configure_pid_max
-
-  rm -rf "$MT_INSTALL_DIR"
-  git clone --depth 1 https://github.com/TelegramMessenger/MTProxy "$MT_INSTALL_DIR"
-  make -C "$MT_INSTALL_DIR"
-
-  if [[ ! -x "${MT_INSTALL_DIR}/objs/bin/mtproto-proxy" ]]; then
-    echo -e "${RED}Build failed: mtproto-proxy binary not found${NC}"
-    sleep 2
-    return 1
-  fi
-
-  mt_download_file "https://core.telegram.org/getProxySecret" "${MT_INSTALL_DIR}/proxy-secret"
-  mt_download_file "https://core.telegram.org/getProxyConfig" "${MT_INSTALL_DIR}/proxy-multi.conf"
-
-  mt_init_dirs
-  MT_SECRET="$(mt_generate_secret)"
-  printf '%s\n' "$MT_SECRET" >"$MT_SECRET_FILE"
-  chmod 600 "$MT_SECRET_FILE"
-
-  mt_save_config
-  mt_write_service
-  mt_firewall_add
-
-  systemctl daemon-reload
-  systemctl enable "${MT_SERVICE}.service" >/dev/null 2>&1
-  systemctl restart "${MT_SERVICE}.service"
-
-  if mt_verify_service_started; then
-    echo
-    echo -e "${GREEN}MTProxy installed successfully${NC}"
-    echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
-    echo
-  fi
-
-  pause
-}
-
-mt_remove() {
-  render_header
-  mt_require_installed || return 1
-  mt_load_config
-
-  read -r -p "Remove MTProxy? Type DELETE: " ans || true
-  [[ "$ans" == "DELETE" ]] || return 0
-
-  systemctl stop "${MT_SERVICE}.service" 2>/dev/null || true
-  systemctl disable "${MT_SERVICE}.service" 2>/dev/null || true
-  rm -f "$MT_SERVICE_FILE"
-
-  if [[ -n "${MT_PORT:-}" ]]; then
-    mt_firewall_remove
-  fi
-
-  rm -rf "$MT_INSTALL_DIR" "$MT_STATE_DIR"
-  systemctl daemon-reload
-
-  echo -e "${GREEN}MTProxy removed${NC}"
-  sleep 2
-}
-
-mt_restart_or_start_service() {
-  render_header
-  mt_require_installed || return 1
-  mt_check_required_commands || {
-    sleep 2
-    return 1
-  }
-  mt_configure_pid_max
-
-  if mt_service_is_running; then
-    systemctl restart "${MT_SERVICE}.service"
-  else
-    systemctl start "${MT_SERVICE}.service"
-  fi
-
-  if mt_verify_service_started; then
-    echo -e "${GREEN}MTProxy service is running${NC}"
-  fi
-
-  sleep 2
-}
-
-mt_stop() {
-  render_header
-  mt_require_installed || return 1
-
-  if mt_service_is_running; then
-    systemctl stop "${MT_SERVICE}.service"
-    echo -e "${GREEN}MTProxy stopped${NC}"
-  else
-    echo -e "${YELLOW}MTProxy is already stopped${NC}"
-  fi
-
-  sleep 2
-}
-
-mt_update() {
-  render_header
-  mt_require_installed || return 1
-  mt_check_required_commands || {
-    sleep 2
-    return 1
-  }
-  mt_load_config
-  mt_configure_pid_max
-
-  git -C "$MT_INSTALL_DIR" pull --ff-only
-  make -C "$MT_INSTALL_DIR"
-
-  if [[ ! -x "${MT_INSTALL_DIR}/objs/bin/mtproto-proxy" ]]; then
-    echo -e "${RED}Build failed: mtproto-proxy binary not found${NC}"
-    sleep 2
-    return 1
-  fi
-
-  mt_download_file "https://core.telegram.org/getProxySecret" "${MT_INSTALL_DIR}/proxy-secret"
-  mt_download_file "https://core.telegram.org/getProxyConfig" "${MT_INSTALL_DIR}/proxy-multi.conf"
-
-  systemctl restart "${MT_SERVICE}.service"
-
-  if mt_verify_service_started; then
-    echo -e "${GREEN}MTProxy updated successfully${NC}"
-  fi
-
-  sleep 2
-}
-
-mt_change_secret() {
-  render_header
-  mt_require_installed || return 1
-  mt_load_config
-
-  menu_item 1 "Generate new secret"
-  menu_item 2 "Enter secret manually"
-  echo
-  menu_enter_hint "Back"
-  echo
-  read_menu_choice choice
-
-  case "$choice" in
-    1)
-      MT_SECRET="$(mt_generate_secret)"
-      ;;
-    2)
-      read -r -p "Enter 32-char hex secret: " MT_SECRET
-      if [[ ! "$MT_SECRET" =~ ^[0-9a-fA-F]{32}$ ]]; then
-        echo -e "${RED}Invalid secret${NC}"
-        sleep 2
-        return 1
-      fi
-      MT_SECRET="${MT_SECRET,,}"
-      ;;
-    "" | 0)
-      return 0
-      ;;
-    *)
-      invalid_choice
-      return 1
-      ;;
-  esac
-
-  printf '%s\n' "$MT_SECRET" >"$MT_SECRET_FILE"
-  chmod 600 "$MT_SECRET_FILE"
-
-  mt_write_service
-  systemctl daemon-reload
-  systemctl restart "${MT_SERVICE}.service"
-
-  if mt_verify_service_started; then
-    echo -e "${GREEN}MTProxy secret updated${NC}"
-    echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
-  fi
-
-  sleep 2
-}
-
-mt_change_tls_domain() {
-  render_header
-  mt_require_installed || return 1
-  mt_load_config
-
-  read -r -p "Enter TLS domain [${MT_TLS_DOMAIN}]: " new_domain
-  new_domain="${new_domain:-$MT_TLS_DOMAIN}"
-
-  if ! valid_domain_name "$new_domain"; then
-    echo -e "${RED}Invalid TLS domain${NC}"
-    sleep 2
-    return 1
-  fi
-
-  echo -e "${WHITE}Checking TLS domain...${NC}"
-  if mt_check_tls_domain "$new_domain"; then
-    MT_TLS_DOMAIN="$new_domain"
-    mt_save_config
-    mt_write_service
+mt_migrate_legacy() {
+  # Remove the legacy C-based MTProxy installation if present.
+  if [[ -f /etc/systemd/system/mtproxy.service ]]; then
+    systemctl stop mtproxy.service 2>/dev/null || true
+    systemctl disable mtproxy.service 2>/dev/null || true
+    rm -f /etc/systemd/system/mtproxy.service
     systemctl daemon-reload
-    systemctl restart "${MT_SERVICE}.service"
-
-    if mt_verify_service_started; then
-      echo -e "${GREEN}MTProxy TLS domain updated${NC}"
-      echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
-    fi
-  else
-    echo -e "${RED}Invalid TLS domain or certificate chain verification failed${NC}"
   fi
 
-  sleep 2
+  rm -rf /opt/MTProxy /etc/sysctl.d/99-mtproxy.conf
+
+  # Remove legacy iptables rules inserted with comment "mtproxy-manager".
+  local old_port old_internal_port
+  old_port=""
+  old_internal_port=""
+  if [[ -f /etc/mtproxy-manager/config ]]; then
+    old_port="$(sed -n 's/^MT_PORT="\([0-9]*\)"$/\1/p' \
+      /etc/mtproxy-manager/config | head -n1 || true)"
+    old_internal_port="$(sed -n 's/^MT_INTERNAL_PORT="\([0-9]*\)"$/\1/p' \
+      /etc/mtproxy-manager/config | head -n1 || true)"
+  fi
+
+  if [[ -n "$old_port" ]]; then
+    while iptables -C INPUT -p tcp --dport "$old_port" \
+      -m comment --comment "mtproxy-manager" -j ACCEPT 2>/dev/null; do
+      iptables -D INPUT -p tcp --dport "$old_port" \
+        -m comment --comment "mtproxy-manager" -j ACCEPT \
+        || break
+    done
+  fi
+
+  if [[ -n "$old_internal_port" ]]; then
+    while iptables -C INPUT -p tcp --dport "$old_internal_port" \
+      ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
+      iptables -D INPUT -p tcp --dport "$old_internal_port" \
+        ! -i lo -m comment --comment "mtproxy-manager" -j DROP \
+        || break
+    done
+    if command -v ip6tables >/dev/null 2>&1; then
+      while ip6tables -C INPUT -p tcp --dport "$old_internal_port" \
+        ! -i lo -m comment --comment "mtproxy-manager" -j DROP 2>/dev/null; do
+        ip6tables -D INPUT -p tcp --dport "$old_internal_port" \
+          ! -i lo -m comment --comment "mtproxy-manager" -j DROP \
+          || break
+      done
+    fi
+  fi
+
+  rm -rf /etc/mtproxy-manager
 }
 
 mt_client_ips_raw() {
@@ -2847,6 +2472,196 @@ mt_client_ips_raw() {
 
 mt_client_ip_count() {
   mt_client_ips_raw | sort -u | wc -l
+}
+
+mt_install() {
+  render_header
+  echo -e "${CYAN}Installing MTProto proxy (mtproto.zig by sleep3r)...${NC}"
+  echo
+
+  local input_port input_tls_domain ans tmp_bootstrap
+  read -r -p "Client port [${MT_DEFAULT_PORT}]: " input_port
+  MT_PORT="${input_port:-$MT_DEFAULT_PORT}"
+
+  if ! mt_validate_port "$MT_PORT"; then
+    echo -e "${RED}Invalid port${NC}"
+    sleep 2
+    return 1
+  fi
+
+  if mt_port_in_use "$MT_PORT"; then
+    echo -e "${RED}Port ${MT_PORT} is already in use by another service${NC}"
+    echo "Check with: ss -tlnp | grep :${MT_PORT}"
+    sleep 2
+    return 1
+  fi
+
+  read -r -p "TLS impersonation domain [${MT_DEFAULT_TLS_DOMAIN}]: " input_tls_domain
+  MT_TLS_DOMAIN="${input_tls_domain:-$MT_DEFAULT_TLS_DOMAIN}"
+
+  if ! valid_domain_name "$MT_TLS_DOMAIN"; then
+    echo -e "${RED}Invalid domain name${NC}"
+    sleep 2
+    return 1
+  fi
+
+  echo
+  echo -e "${YELLOW}Warning:${NC} the TLS domain cannot be changed after installation."
+  echo "A reinstall is required to change it; all existing tg:// links will stop working."
+  echo
+  read -r -p "Confirm installation with domain '${MT_TLS_DOMAIN}'? [y/N]: " ans || true
+  [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y curl ca-certificates xxd iptables iptables-persistent
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo -e "${RED}curl is required${NC}"
+    sleep 2
+    return 1
+  fi
+
+  mt_migrate_legacy
+
+  tmp_bootstrap="$(mktemp /tmp/mtproto-bootstrap.XXXXXX.sh)"
+  curl -fsSL "$MT_BOOTSTRAP_URL" -o "$tmp_bootstrap"
+  bash "$tmp_bootstrap"
+  rm -f "$tmp_bootstrap"
+
+  if [[ ! -x "$MT_BUDDY_BIN" ]]; then
+    echo -e "${RED}mtbuddy not found after bootstrap — installation failed${NC}"
+    sleep 2
+    return 1
+  fi
+
+  "$MT_BUDDY_BIN" install --port "$MT_PORT" --domain "$MT_TLS_DOMAIN" --yes
+
+  if [[ ! -d "$MT_INSTALL_DIR" ]]; then
+    echo -e "${RED}Installation failed: ${MT_INSTALL_DIR} not found${NC}"
+    sleep 2
+    return 1
+  fi
+
+  mt_firewall_add
+  systemctl daemon-reload
+  systemctl enable "${MT_SERVICE}.service" >/dev/null 2>&1
+
+  if ! mt_service_is_running; then
+    systemctl start "${MT_SERVICE}.service"
+  fi
+
+  if mt_verify_service_started; then
+    echo
+    echo -e "${GREEN}MTProto proxy installed successfully${NC}"
+    mt_load_config
+    echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
+    echo
+  fi
+
+  pause
+}
+
+mt_remove() {
+  render_header
+  mt_require_installed || return 1
+  mt_load_config
+
+  read -r -p "Remove MTProto proxy? Type DELETE: " ans || true
+  [[ "$ans" == "DELETE" ]] || return 0
+
+  mt_firewall_remove
+
+  systemctl stop "${MT_SERVICE}.service" 2>/dev/null || true
+  systemctl disable "${MT_SERVICE}.service" 2>/dev/null || true
+
+  if [[ -x "$MT_BUDDY_BIN" ]]; then
+    "$MT_BUDDY_BIN" remove --yes 2>/dev/null || true
+  fi
+
+  rm -f "$MT_SERVICE_FILE"
+  rm -rf "$MT_INSTALL_DIR"
+  rm -f "$MT_BUDDY_BIN"
+  systemctl daemon-reload
+
+  echo -e "${GREEN}MTProto proxy removed${NC}"
+  sleep 2
+}
+
+mt_restart_or_start_service() {
+  render_header
+  mt_require_installed || return 1
+
+  if mt_service_is_running; then
+    systemctl restart "${MT_SERVICE}.service"
+  else
+    systemctl start "${MT_SERVICE}.service"
+  fi
+
+  if mt_verify_service_started; then
+    echo -e "${GREEN}MTProto proxy service is running${NC}"
+  fi
+
+  sleep 2
+}
+
+mt_stop() {
+  render_header
+  mt_require_installed || return 1
+
+  if mt_service_is_running; then
+    systemctl stop "${MT_SERVICE}.service"
+    echo -e "${GREEN}MTProto proxy stopped${NC}"
+  else
+    echo -e "${YELLOW}MTProto proxy is already stopped${NC}"
+  fi
+
+  sleep 2
+}
+
+mt_update() {
+  render_header
+  mt_require_installed || return 1
+  mt_load_config
+
+  if [[ ! -x "$MT_BUDDY_BIN" ]]; then
+    echo -e "${RED}mtbuddy not found; cannot update${NC}"
+    sleep 2
+    return 1
+  fi
+
+  "$MT_BUDDY_BIN" upgrade
+
+  systemctl restart "${MT_SERVICE}.service"
+  if mt_verify_service_started; then
+    echo -e "${GREEN}MTProto proxy updated successfully${NC}"
+  fi
+
+  sleep 2
+}
+
+mt_add_user() {
+  render_header
+  mt_require_installed || return 1
+
+  local username
+  read -r -p "Username: " username
+  if [[ -z "$username" ]]; then
+    echo -e "${RED}Username cannot be empty${NC}"
+    sleep 2
+    return 1
+  fi
+
+  if "$MT_BUDDY_BIN" user add "$username"; then
+    mt_load_config
+    echo
+    echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
+  else
+    echo
+    echo "See 'mtbuddy --help' for user management commands."
+  fi
+
+  sleep 2
 }
 
 mt_show_active_ips() {
@@ -2866,8 +2681,9 @@ mt_show_active_ips() {
   mt_client_ips_raw | sort | uniq -c | sort -nr | head -20
 
   echo
-  echo -e "${YELLOW}Stats:${NC}"
-  curl -fsS "http://127.0.0.1:${MT_INTERNAL_PORT}/stats" | sed -n '1,20p' || echo "Stats unavailable"
+  echo -e "${YELLOW}Dashboard (localhost:61208, access via SSH tunnel):${NC}"
+  curl -fsS "http://127.0.0.1:61208/" 2>/dev/null | head -5 \
+    || echo "Dashboard unavailable"
 
   echo
   pause
@@ -2878,17 +2694,15 @@ mt_show_logs() {
   mt_require_installed || return 1
   journalctl -u "${MT_SERVICE}.service" -b -n 50 --no-pager || true
   echo
-  mt_show_pid_max_warning_if_needed
   pause
 }
 
 mt_show_status_link() {
   render_header
   mt_load_config
-  echo -e "${YELLOW}MTProxy status:${NC} $(mt_service_status)"
+  echo -e "${YELLOW}MTProto proxy status:${NC} $(mt_service_status)"
   echo -e "${YELLOW}Port:${NC} ${MT_PORT}"
-  echo -e "${YELLOW}Internal port:${NC} ${MT_INTERNAL_PORT}"
-  echo -e "${YELLOW}TLS domain:${NC} ${MT_TLS_DOMAIN}"
+  echo -e "${YELLOW}TLS domain:${NC} ${MT_TLS_DOMAIN} (permanent)"
   echo -e "${YELLOW}Active IPs:${NC} $(mt_client_ip_count 2>/dev/null || echo 0)"
   echo
   echo -e "${YELLOW}Link:${NC} $(mt_build_link 2>/dev/null || true)"
@@ -2912,14 +2726,14 @@ mt_status_block() {
     link="-"
   fi
 
-  echo -e "  ${CYAN}MTProxy Manager by Nikitid${NC}"
+  # mtproto.zig by Aleksandr Kalashnikov (MIT), integrated by Nikitid
+  echo -e "  ${CYAN}MTProto Proxy Manager by Nikitid${NC}"
   printf '%27b\n' "${WHITE}v${SCRIPT_VERSION}${NC}"
   echo
 
   status_line "Install status:" "$install_status"
   status_line "Service status:" "$service_status"
   status_line "Port:" "${MT_PORT:-}"
-  status_line "Internal port:" "${MT_INTERNAL_PORT:-}"
   status_line "TLS domain:" "${MT_TLS_DOMAIN:-}"
   status_line "Active IPs:" "$users"
   echo
@@ -2940,35 +2754,7 @@ mtproxy_menu() {
         menu_item 2 "Restart proxy"
         menu_item 3 "Stop proxy"
         menu_item 4 "Update proxy"
-        menu_item 5 "Change secret"
-        menu_item 6 "Change TLS domain"
-        menu_item 7 "Show active IPs"
-        menu_item 8 "Show status/link"
-        menu_item 9 "Show logs"
-        echo
-        menu_enter_hint "Back"
-        echo
-        read_menu_choice choice
-
-        case "$choice" in
-          1) mt_remove ;;
-          2) mt_restart_or_start_service ;;
-          3) mt_stop ;;
-          4) mt_update ;;
-          5) mt_change_secret ;;
-          6) mt_change_tls_domain ;;
-          7) mt_show_active_ips ;;
-          8) mt_show_status_link ;;
-          9) mt_show_logs ;;
-          "" | 0) return 0 ;;
-          *) invalid_choice ;;
-        esac
-      else
-        menu_item 1 "Remove proxy"
-        menu_item 2 "Start proxy"
-        menu_item 3 "Update proxy"
-        menu_item 4 "Change secret"
-        menu_item 5 "Change TLS domain"
+        menu_item 5 "Add user"
         menu_item 6 "Show active IPs"
         menu_item 7 "Show status/link"
         menu_item 8 "Show logs"
@@ -2980,12 +2766,36 @@ mtproxy_menu() {
         case "$choice" in
           1) mt_remove ;;
           2) mt_restart_or_start_service ;;
-          3) mt_update ;;
-          4) mt_change_secret ;;
-          5) mt_change_tls_domain ;;
+          3) mt_stop ;;
+          4) mt_update ;;
+          5) mt_add_user ;;
           6) mt_show_active_ips ;;
           7) mt_show_status_link ;;
           8) mt_show_logs ;;
+          "" | 0) return 0 ;;
+          *) invalid_choice ;;
+        esac
+      else
+        menu_item 1 "Remove proxy"
+        menu_item 2 "Start proxy"
+        menu_item 3 "Update proxy"
+        menu_item 4 "Add user"
+        menu_item 5 "Show active IPs"
+        menu_item 6 "Show status/link"
+        menu_item 7 "Show logs"
+        echo
+        menu_enter_hint "Back"
+        echo
+        read_menu_choice choice
+
+        case "$choice" in
+          1) mt_remove ;;
+          2) mt_restart_or_start_service ;;
+          3) mt_update ;;
+          4) mt_add_user ;;
+          5) mt_show_active_ips ;;
+          6) mt_show_status_link ;;
+          7) mt_show_logs ;;
           "" | 0) return 0 ;;
           *) invalid_choice ;;
         esac
@@ -3227,7 +3037,7 @@ firewall_hardening_menu() {
   echo "Extra UDP:      ${HARDEN_UDP_PORTS:-none}"
   echo "Isolation:      ${CLIENT_ISOLATION:-1} (1 = drop client-to-client)"
   echo
-  echo "SSH, ICMP, IKEv2/ESP and the MTProxy port are always allowed."
+  echo "SSH, ICMP, IKEv2/ESP and the MTProto proxy port are always allowed."
   echo
 
   local harden tcp_ports udp_ports isolation
@@ -3395,7 +3205,7 @@ main_menu_not_installed() {
     render_header
     menu_item 1 "Install IKEv2 server"
     echo
-    menu_item 2 "MTProxy manager"
+    menu_item 2 "MTProto proxy manager"
     menu_item 3 "3x-ui manager"
     echo
     menu_item 4 "Show diagnostics"
@@ -3430,7 +3240,7 @@ main_menu_installed() {
       echo
       menu_item 4 "VPN users"
       echo
-      menu_item 5 "MTProxy manager"
+      menu_item 5 "MTProto proxy manager"
       menu_item 6 "3x-ui manager"
       echo
       menu_item 7 "Service menu"
@@ -3455,7 +3265,7 @@ main_menu_installed() {
       echo
       menu_item 3 "VPN users"
       echo
-      menu_item 4 "MTProxy manager"
+      menu_item 4 "MTProto proxy manager"
       menu_item 5 "3x-ui manager"
       echo
       menu_item 6 "Service menu"

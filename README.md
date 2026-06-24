@@ -23,7 +23,7 @@
 - IPv4 full tunnel, защита от утечек IPv6 или NAT66;
 - изоляция VPN-клиентов и ограничение входящего трафика;
 - диагностика, журналы, управление службами и обновление сертификатов;
-- дополнительное управление MTProxy и 3x-ui.
+- дополнительное управление MTProto-прокси ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT) и 3x-ui.
 
 ## Требования
 
