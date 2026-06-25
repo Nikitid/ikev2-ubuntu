@@ -4,7 +4,7 @@ set -uo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
@@ -2233,7 +2233,7 @@ EOF_WINPS
 # Backend: mtproto.zig — a lightweight Telegram proxy in Zig with FakeTLS.
 # Source:  https://github.com/sleep3r/mtproto.zig
 # Author:  Aleksandr Kalashnikov (sleep3r)
-# License: MIT — copyright notice preserved in comments and documentation.
+# License: MIT — copyright notice preserved in THIRD_PARTY_LICENSES.md.
 #
 # The proxy is installed and managed via the mtbuddy CLI downloaded from the
 # project's GitHub releases. The TLS impersonation domain (tls_domain) is
@@ -2272,7 +2272,7 @@ mt_load_config() {
   [[ -n "$raw_domain" ]] && MT_TLS_DOMAIN="$raw_domain"
 
   MT_SECRET="$(awk '/^\[access\.users\]/{f=1;next} /^\[/{f=0} \
-    f && /=[[:space:]]*"/{sub(/^[^=]*=[[:space:]]*/,""); gsub(/".*/,""); print; exit}' \
+    f && /=[[:space:]]*"/{sub(/^[^=]*=[[:space:]]*"/,""); sub(/".*$/,""); print; exit}' \
     "$MT_CONFIG_FILE" 2>/dev/null || true)"
 }
 
