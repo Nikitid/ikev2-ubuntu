@@ -12,7 +12,7 @@ ACME certificates, EAP-MSCHAPv2 users, and firewall rules.
 ## Status
 
 Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
-`v1.2.0`.
+`v1.3.0`.
 
 ## Features
 
@@ -36,7 +36,7 @@ Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
 Pinned stable release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.2.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.3.0/scripts/ikev2-manager.sh)
 ```
 
 Current `main` branch:
@@ -76,4 +76,5 @@ reporting guidance.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Copyright notices for bundled components are in
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
