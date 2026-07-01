@@ -193,6 +193,12 @@ assert_eq "escape_swanctl escapes backslash" 'a\\b' "$(escape_swanctl 'a\b')"
 assert_eq "html_escape escapes markup" "&lt;b&gt;&amp;&quot;" "$(html_escape '<b>&"')"
 assert_eq "trim strips whitespace" "abc" "$(trim "  abc  ")"
 
+if grep -q -- '--clear-creds' "$TESTS_DIR/../scripts/ikev2-manager.sh"; then
+  fail "swanctl reload must use supported --clear option"
+else
+  pass
+fi
+
 echo
 echo "Passed: $PASSED, failed: $FAILED"
 ((FAILED == 0))

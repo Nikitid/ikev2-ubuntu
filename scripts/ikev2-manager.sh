@@ -1796,8 +1796,8 @@ add_or_update_user() {
 
   generate_swanctl_conf
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
-  # --clear-creds drops stale in-memory secrets (e.g. an old password).
-  if ! swanctl --load-all --clear-creds >/dev/null 2>&1; then
+  # --clear drops stale in-memory credentials (e.g. an old password).
+  if ! swanctl --load-all --clear >/dev/null 2>&1; then
     echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
@@ -1886,8 +1886,8 @@ remove_user_menu() {
 
   generate_swanctl_conf
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
-  # --clear-creds ensures the removed user's secret is unloaded from charon.
-  if ! swanctl --load-all --clear-creds >/dev/null 2>&1; then
+  # --clear ensures the removed user's secret is unloaded from charon.
+  if ! swanctl --load-all --clear >/dev/null 2>&1; then
     echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
