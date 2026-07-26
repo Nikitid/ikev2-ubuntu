@@ -4,7 +4,7 @@ set -uo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
@@ -70,6 +70,9 @@ DEFAULT_LOCAL_TS="0.0.0.0/0"
 DEFAULT_CLIENT_ISOLATION="1"
 # Inbound hardening appends a default-drop allowlist chain to INPUT.
 DEFAULT_HARDEN_INPUT="0"
+# Keep enough conntrack capacity for short NAT/VPN traffic bursts on small VPS
+# instances. Existing higher administrator-defined limits are preserved.
+MIN_CONNTRACK_MAX="32768"
 
 trap 'LAST_ERROR="Command failed on line $LINENO"' ERR
 
@@ -263,6 +266,36 @@ append_missing_csv_items() {
 ensure_apple_esp_proposals() {
   local proposals="${1:-$DEFAULT_ESP_PROPOSALS}"
   append_missing_csv_items "$proposals" "$APPLE_REKEY_ESP_PROPOSALS"
+}
+
+conntrack_target_max() {
+  local current="${1:-0}"
+  if [[ "$current" =~ ^[0-9]+$ ]] && ((current > MIN_CONNTRACK_MAX)); then
+    printf '%s' "$current"
+  else
+    printf '%s' "$MIN_CONNTRACK_MAX"
+  fi
+}
+
+conntrack_status() {
+  local count max usage status
+  count="$(sysctl -n net.netfilter.nf_conntrack_count 2>/dev/null || true)"
+  max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+  if [[ ! "$count" =~ ^[0-9]+$ || ! "$max" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'unavailable'
+    return 0
+  fi
+
+  usage=$((count * 100 / max))
+  status="${count}/${max} (${usage}%)"
+  if ((max < MIN_CONNTRACK_MAX)); then
+    status+="; limit below ${MIN_CONNTRACK_MAX}"
+  elif ((usage >= 90)); then
+    status+="; critical"
+  elif ((usage >= 70)); then
+    status+="; warning"
+  fi
+  printf '%s' "$status"
 }
 
 # Drop IPv6 resolvers from a comma-separated DNS list; they are unreachable
@@ -1324,8 +1357,17 @@ ensure_kernel_ipsec_support() {
 }
 
 enable_sysctl() {
+  local current_conntrack_max target_conntrack_max
+  modprobe nf_conntrack >/dev/null 2>&1 || {
+    echo "Failed to load nf_conntrack kernel module."
+    return 1
+  }
+  current_conntrack_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+  target_conntrack_max="$(conntrack_target_max "$current_conntrack_max")"
+
   {
     echo "net.ipv4.ip_forward=1"
+    echo "net.netfilter.nf_conntrack_max=$target_conntrack_max"
     if [[ "${IPV6_MODE:-off}" == "nat" ]]; then
       echo "net.ipv6.conf.all.forwarding=1"
     fi
@@ -2984,6 +3026,7 @@ show_diagnostics() {
   echo "Service name: $(detect_service_name).service"
   echo "Service state: $(systemctl is-active "$(detect_service_name).service" 2>/dev/null || true)"
   echo "IPv4 forward: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
+  echo "Conntrack:    $(conntrack_status)"
   echo "ACME mode:    ${ACME_MODE:-dns-01}${DNS_PROVIDER:+ / ${DNS_PROVIDER}}"
   echo "Uplink iface: ${UPLINK_IF:-unset}"
   echo "Pool CIDR:    ${VPN_POOL_CIDR}"
