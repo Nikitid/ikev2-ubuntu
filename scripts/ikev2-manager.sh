@@ -10,6 +10,7 @@ CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
 USERS_DB="$MANAGER_DIR/users.db"
 EXPORTS_DIR="$MANAGER_DIR/exports"
+CERT_RELOAD_SCRIPT="$MANAGER_DIR/reload-certificate.sh"
 
 # MTProto proxy manager paths
 # Backend: mtproto.zig by Aleksandr Kalashnikov (sleep3r)
@@ -22,11 +23,6 @@ MT_SERVICE_FILE="/etc/systemd/system/${MT_SERVICE}.service"
 MT_DEFAULT_PORT="443"
 MT_DEFAULT_TLS_DOMAIN="rutube.ru"
 MT_BOOTSTRAP_URL="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
-
-# 3x-ui paths
-XUI_SERVICE="x-ui"
-XUI_DIR="/usr/local/x-ui"
-XUI_INSTALL_CMD='bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)'
 
 SWANCTL_CONF="/etc/swanctl/swanctl.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-ikev2-manager.conf"
@@ -56,6 +52,7 @@ DEFAULT_CERT_NAME="ikev2.pem"
 DEFAULT_CERT_PATH="/etc/swanctl/x509/ikev2.pem"
 DEFAULT_CA_PATH="/etc/swanctl/x509ca/issuer-ca.pem"
 DEFAULT_KEY_PATH="/etc/swanctl/private/ikev2.key"
+CA_CHAIN_PREFIX="/etc/swanctl/x509ca/ikev2-chain"
 DEFAULT_POOL_RANGE="10.20.20.10-10.20.20.250"
 DEFAULT_POOL_CIDR="10.20.20.0/24"
 # IPv6 behavior: block = clients tunnel IPv6 and the server drops it (no
@@ -536,6 +533,21 @@ cert_days_left() {
   echo $(((end_epoch - now_epoch) / 86400))
 }
 
+cert_issuer_cn() {
+  [[ -f "$CERT_PATH" ]] || return 1
+  openssl x509 -in "$CERT_PATH" -noout -issuer 2>/dev/null \
+    | sed -nE 's/.*CN[[:space:]]*=[[:space:]]*([^,/]+).*/\1/p'
+}
+
+ca_chain_file_count() {
+  local file count=0
+  for file in "${CA_CHAIN_PREFIX}"-*.pem; do
+    [[ -f "$file" ]] || continue
+    count=$((count + 1))
+  done
+  printf '%s' "$count"
+}
+
 has_nat_rule() {
   [[ -n "${UPLINK_IF:-}" ]] || return 1
   iptables -t nat -C POSTROUTING -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1
@@ -589,6 +601,42 @@ read_menu_choice() {
   printf -v "$__var" '%s' "$__choice"
 }
 
+acme_mode_from_choice() {
+  local choice
+  choice="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$choice" in
+    1 | dns | dns-01) printf 'dns-01' ;;
+    2 | http | http-01) printf 'http-01' ;;
+    *) return 1 ;;
+  esac
+}
+
+select_acme_mode() {
+  local __var="$1"
+  local current="${2:-$DEFAULT_ACME_MODE}"
+  local choice selected
+
+  echo "ACME validation mode"
+  echo "--------------------"
+  menu_item 1 "DNS-01 — DNS API credentials; no inbound port 80 required"
+  menu_item 2 "HTTP-01 — standalone validation; requires inbound TCP/80"
+  echo
+  echo "Current: $current (press Enter to keep)"
+
+  while true; do
+    read_menu_choice choice
+    if [[ -z "$choice" ]]; then
+      selected="$current"
+      break
+    fi
+    if selected="$(acme_mode_from_choice "$choice")"; then
+      break
+    fi
+    echo -e "${YELLOW}Select 1 for DNS-01 or 2 for HTTP-01.${NC}"
+  done
+  printf -v "$__var" '%s' "$selected"
+}
+
 invalid_choice() {
   echo -e "${YELLOW}Invalid choice.${NC}"
   sleep 1
@@ -608,7 +656,7 @@ render_header() {
     install_state="not installed"
   fi
 
-  echo -e "${CYAN}Nikitid Network Manager${NC}"
+  echo -e "${CYAN}ikev2-ubuntu${NC}"
   printf '%27b\n' "${WHITE}v${SCRIPT_VERSION}${NC}"
   echo
 
@@ -617,7 +665,6 @@ render_header() {
     status_line "OS:" "$os_state"
     status_line "Topology hint:" "$topology_state"
     status_line "MTProto proxy:" "$(mt_service_status)"
-    status_line "3x-ui:" "$(xui_status)"
     echo
     if [[ -n "$LAST_ERROR" ]]; then
       printf "${RED}Last error:${NC} %s\n\n" "$LAST_ERROR"
@@ -665,7 +712,6 @@ render_header() {
   status_line "Pool / DNS:" "$quick_state"
   status_line "IPv6 mode:" "${IPV6_MODE:-off}"
   status_line "MTProto proxy:" "$(mt_service_status)"
-  status_line "3x-ui:" "$(xui_status)"
   echo
   if [[ -n "$LAST_ERROR" ]]; then
     printf "${RED}Last error:${NC} %s\n\n" "$LAST_ERROR"
@@ -736,6 +782,83 @@ backup_file() {
   local target="$1"
   [[ -f "$target" ]] || return 0
   cp -a "$target" "${target}.bak.$(date +%Y%m%d-%H%M%S)"
+}
+
+write_certificate_reload_script() {
+  ensure_manager_dir
+  cat >"$CERT_RELOAD_SCRIPT" <<EOF_RELOAD
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+ca_bundle='${CA_PATH}'
+chain_prefix='${CA_CHAIN_PREFIX}'
+swanctl_conf='${SWANCTL_CONF}'
+service_name='$(detect_service_name)'
+
+[[ -s "\$ca_bundle" ]]
+rm -f "\${chain_prefix}"-*.pem
+awk -v prefix="\$chain_prefix" '
+  /-----BEGIN CERTIFICATE-----/ {
+    count++
+    output = sprintf("%s-%02d.pem", prefix, count)
+  }
+  output != "" { print > output }
+  /-----END CERTIFICATE-----/ {
+    close(output)
+    output = ""
+  }
+  END { if (count == 0 || output != "") exit 1 }
+' "\$ca_bundle"
+chmod 644 "\${chain_prefix}"-*.pem
+
+chain_names=""
+for file in "\${chain_prefix}"-*.pem; do
+  [[ -f "\$file" ]] || continue
+  [[ -z "\$chain_names" ]] || chain_names+=", "
+  chain_names+="\$(basename "\$file")"
+done
+
+if [[ -f "\$swanctl_conf" && -n "\$chain_names" ]]; then
+  config_tmp="\${swanctl_conf}.tmp.\$\$"
+  awk -v replacement="      cacerts = \$chain_names" '
+    /^[[:space:]]*cacerts[[:space:]]*=/ {
+      print replacement
+      inserted = 1
+      next
+    }
+    {
+      print
+      if (!inserted && \$0 ~ /^[[:space:]]+certs[[:space:]]*=/) {
+        print replacement
+        inserted = 1
+      }
+    }
+    END { if (!inserted) exit 1 }
+  ' "\$swanctl_conf" >"\$config_tmp"
+  chmod 600 "\$config_tmp"
+  mv -f "\$config_tmp" "\$swanctl_conf"
+fi
+
+if systemctl is-active --quiet "\${service_name}.service"; then
+  swanctl --load-creds --clear >/dev/null 2>&1 && \
+    swanctl --load-conns >/dev/null 2>&1 || \
+    systemctl restart "\${service_name}.service"
+fi
+EOF_RELOAD
+  chmod 700 "$CERT_RELOAD_SCRIPT"
+}
+
+ca_chain_config_names() {
+  local file names=""
+  for file in "${CA_CHAIN_PREFIX}"-*.pem; do
+    [[ -f "$file" ]] || continue
+    if [[ -n "$names" ]]; then
+      names+=", "
+    fi
+    names+="$(basename "$file")"
+  done
+  printf '%s' "$names"
 }
 
 ensure_packages() {
@@ -1091,6 +1214,7 @@ cleanup_acme_binding() {
 
 cleanup_managed_files() {
   rm -f "$SWANCTL_CONF" "$CERT_PATH" "$CA_PATH" "$KEY_PATH"
+  rm -f "${CA_CHAIN_PREFIX}"-*.pem "$CERT_RELOAD_SCRIPT"
   rm -f "${CERT_PATH}".bak.* "${CA_PATH}".bak.* "${KEY_PATH}".bak.* "${SWANCTL_CONF}".bak.* 2>/dev/null || true
   rm -f /etc/swanctl/conf.d/*.conf 2>/dev/null || true
   rmdir /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private /etc/swanctl/conf.d /etc/swanctl 2>/dev/null || true
@@ -1229,6 +1353,11 @@ generate_swanctl_conf() {
   # In block/nat modes clients get an IPv6 address and a ::/0 selector, so
   # dual-stack devices route IPv6 into the tunnel instead of leaking it.
   local effective_local_ts="$LOCAL_TS" pool_list="vpn_pool" pool6_block=""
+  local ca_chain_names ca_chain_line=""
+  ca_chain_names="$(ca_chain_config_names)"
+  if [[ -n "$ca_chain_names" ]]; then
+    ca_chain_line="      cacerts = ${ca_chain_names}"
+  fi
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
     if [[ ",$LOCAL_TS," != *",::/0,"* ]]; then
       effective_local_ts="${LOCAL_TS},::/0"
@@ -1256,6 +1385,7 @@ connections {
       auth = pubkey
       certs = ${CERT_NAME}
       id = ${DOMAIN}
+${ca_chain_line}
     }
 
     remote {
@@ -1352,6 +1482,7 @@ issue_and_install_cert() {
   }
 
   mkdir -p /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
+  write_certificate_reload_script
   backup_file "$CERT_PATH"
   backup_file "$CA_PATH"
   backup_file "$KEY_PATH"
@@ -1396,7 +1527,7 @@ issue_and_install_cert() {
     --cert-file "$CERT_PATH" \
     --ca-file "$CA_PATH" \
     --key-file "$KEY_PATH" \
-    --reloadcmd "swanctl --load-creds >/dev/null 2>&1 || systemctl restart $(detect_service_name)"
+    --reloadcmd "$CERT_RELOAD_SCRIPT"
 }
 validate_acme_env() {
   case "${ACME_MODE:-dns-01}" in
@@ -1548,8 +1679,8 @@ install_wizard() {
 
   DOMAIN=$(ask "Domain name for VPN server" "${DOMAIN:-}")
   ACME_EMAIL=$(ask "Email for acme.sh (optional)" "${ACME_EMAIL:-}")
-  ACME_MODE=$(ask "ACME validation mode (dns-01/http-01)" "${ACME_MODE:-dns-01}")
-  ACME_MODE="${ACME_MODE,,}"
+  echo
+  select_acme_mode ACME_MODE "${ACME_MODE:-$DEFAULT_ACME_MODE}"
 
   DNS_PROVIDER="${DNS_PROVIDER:-dns_timeweb}"
   if [[ "$ACME_MODE" == "dns-01" ]]; then
@@ -2816,102 +2947,6 @@ mtproxy_menu() {
   done
 }
 
-# ------------------------- 3x-ui manager -------------------------
-xui_is_installed() { command -v x-ui >/dev/null 2>&1 || [[ -x "$XUI_DIR/x-ui" || -f /etc/systemd/system/x-ui.service || -f /usr/lib/systemd/system/x-ui.service ]]; }
-xui_status() {
-  if ! xui_is_installed; then
-    echo "not-installed"
-    return 0
-  fi
-  local a s
-  a=$(systemctl show -p ActiveState --value "${XUI_SERVICE}.service" 2>/dev/null || true)
-  s=$(systemctl show -p SubState --value "${XUI_SERVICE}.service" 2>/dev/null || true)
-  [[ -n "$a" ]] && echo "${a}${s:+/$s}" || echo "unknown"
-}
-xui_install() {
-  render_header
-  echo "This will run official 3x-ui installer from MHSanaei/3x-ui."
-  echo "Command: $XUI_INSTALL_CMD"
-  echo
-  read -r -p "Continue? [y/N]: " ans || true
-  [[ "$ans" =~ ^[Yy]$ ]] || return 0
-  apt-get update
-  apt-get install -y curl ca-certificates
-  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-  echo
-  echo "3x-ui status: $(xui_status)"
-  pause
-}
-xui_info() {
-  render_header
-  if ! xui_is_installed; then
-    echo "3x-ui is not installed."
-    pause
-    return 0
-  fi
-  echo "3x-ui status: $(xui_status)"
-  echo
-  if command -v x-ui >/dev/null 2>&1; then
-    x-ui status 2>/dev/null || true
-    echo
-    x-ui settings 2>/dev/null || true
-  elif [[ -x "$XUI_DIR/x-ui" ]]; then
-    "$XUI_DIR/x-ui" status 2>/dev/null || true
-    echo
-    "$XUI_DIR/x-ui" settings 2>/dev/null || true
-  fi
-  echo
-  journalctl -u x-ui -n 40 --no-pager 2>/dev/null || true
-  pause
-}
-xui_restart() {
-  render_header
-  if ! xui_is_installed; then
-    echo "3x-ui is not installed."
-    pause
-    return 0
-  fi
-  systemctl restart x-ui
-  echo "3x-ui restarted."
-  pause
-}
-xui_menu() {
-  local choice
-  while true; do
-    render_header
-    echo "3x-ui"
-    echo "-----"
-
-    if ! xui_is_installed; then
-      menu_item 1 "Install 3x-ui"
-      echo
-      menu_enter_hint "Back"
-      echo
-      read_menu_choice choice
-      case "$choice" in
-        1) xui_install ;;
-        "" | 0) return 0 ;;
-        *) invalid_choice ;;
-      esac
-    else
-      menu_item 1 "Show 3x-ui status/settings/logs"
-      menu_item 2 "Restart 3x-ui"
-      menu_item 3 "Reinstall 3x-ui"
-      echo
-      menu_enter_hint "Back"
-      echo
-      read_menu_choice choice
-      case "$choice" in
-        1) xui_info ;;
-        2) xui_restart ;;
-        3) xui_install ;;
-        "" | 0) return 0 ;;
-        *) invalid_choice ;;
-      esac
-    fi
-  done
-}
-
 show_client_info() {
   render_header
   cat <<EOF_INFO
@@ -2977,6 +3012,8 @@ show_diagnostics() {
   if [[ -f "$CERT_PATH" ]]; then
     openssl x509 -in "$CERT_PATH" -noout -subject -issuer -dates || true
     echo "Public Key Algorithm: $(cert_public_key_alg || true)"
+    echo "Issuer CN:            $(cert_issuer_cn || echo unknown)"
+    echo "Loaded CA chain files: $(ca_chain_file_count)"
   else
     echo "Certificate file missing: $CERT_PATH"
   fi
@@ -3206,9 +3243,8 @@ main_menu_not_installed() {
     menu_item 1 "Install IKEv2 server"
     echo
     menu_item 2 "MTProto proxy manager"
-    menu_item 3 "3x-ui manager"
     echo
-    menu_item 4 "Show diagnostics"
+    menu_item 3 "Show diagnostics"
     echo
     menu_enter_hint "Exit"
     echo
@@ -3216,8 +3252,7 @@ main_menu_not_installed() {
     case "$choice" in
       1) install_wizard ;;
       2) mtproxy_menu ;;
-      3) xui_menu ;;
-      4) show_diagnostics ;;
+      3) show_diagnostics ;;
       "" | 0) exit 0 ;;
       *) invalid_choice ;;
     esac
@@ -3241,9 +3276,8 @@ main_menu_installed() {
       menu_item 4 "VPN users"
       echo
       menu_item 5 "MTProto proxy manager"
-      menu_item 6 "3x-ui manager"
       echo
-      menu_item 7 "Service menu"
+      menu_item 6 "Service menu"
       echo
       menu_enter_hint "Exit"
       echo
@@ -3254,8 +3288,7 @@ main_menu_installed() {
         3) install_wizard ;;
         4) vpn_users_menu ;;
         5) mtproxy_menu ;;
-        6) xui_menu ;;
-        7) service_tools_menu ;;
+        6) service_tools_menu ;;
         "" | 0) exit 0 ;;
         *) invalid_choice ;;
       esac
@@ -3266,9 +3299,8 @@ main_menu_installed() {
       menu_item 3 "VPN users"
       echo
       menu_item 4 "MTProto proxy manager"
-      menu_item 5 "3x-ui manager"
       echo
-      menu_item 6 "Service menu"
+      menu_item 5 "Service menu"
       echo
       menu_enter_hint "Exit"
       echo
@@ -3278,8 +3310,7 @@ main_menu_installed() {
         2) install_wizard ;;
         3) vpn_users_menu ;;
         4) mtproxy_menu ;;
-        5) xui_menu ;;
-        6) service_tools_menu ;;
+        5) service_tools_menu ;;
         "" | 0) exit 0 ;;
         *) invalid_choice ;;
       esac

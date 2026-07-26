@@ -1,9 +1,9 @@
-# IKEv2 Manager
+# ikev2-ubuntu
 
 [Русский](README.md)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Checks](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml/badge.svg)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
+[![Checks](https://github.com/Nikitid/ikev2-ubuntu/actions/workflows/check.yml/badge.svg)](https://github.com/Nikitid/ikev2-ubuntu/actions/workflows/check.yml)
 
 Interactive Bash manager for installing and maintaining an IKEv2/IPsec server
 on Ubuntu. It targets a single-server setup based on strongSwan with `swanctl`,
@@ -22,7 +22,7 @@ Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
 - IPv4 full tunnel, IPv6 leak protection, or NAT66;
 - optional VPN client isolation and inbound firewall restrictions;
 - diagnostics, logs, service control, and certificate renewal;
-- optional MTProto proxy management ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT) and 3x-ui.
+- optional MTProto proxy management ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT).
 
 ## Requirements
 
@@ -36,13 +36,13 @@ Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
 Pinned stable release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.3.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.0/scripts/ikev2-manager.sh)
 ```
 
 Current `main` branch:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/main/scripts/ikev2-manager.sh)
 ```
 
 Review remote scripts before running them and prefer a pinned release tag.
@@ -56,6 +56,14 @@ The script opens an interactive menu. Managed state is stored under
 - `http-01` requires inbound TCP port `80` while issuing a certificate.
 - `dns-01` requires credentials for the selected DNS provider.
 - VPN passwords and exported client bundles contain secrets.
+
+### Windows error 13801 after certificate renewal
+
+New Let's Encrypt chains may contain multiple intermediate certificates. The
+manager splits the CA bundle into separate PEM files so strongSwan loads and
+sends the complete chain. After updating an existing installation, reissue the
+certificate from the service menu and check `Loaded CA chain files` in
+diagnostics.
 
 ## Development
 
