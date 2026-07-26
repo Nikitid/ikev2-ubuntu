@@ -4,7 +4,7 @@ set -uo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
@@ -25,6 +25,9 @@ MT_DEFAULT_TLS_DOMAIN="rutube.ru"
 MT_BOOTSTRAP_URL="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
 
 SWANCTL_CONF="/etc/swanctl/swanctl.conf"
+SWANCTL_X509_DIR="/etc/swanctl/x509"
+SWANCTL_X509CA_DIR="/etc/swanctl/x509ca"
+SWANCTL_PRIVATE_DIR="/etc/swanctl/private"
 SYSCTL_FILE="/etc/sysctl.d/99-ikev2-manager.conf"
 FIREWALL_SCRIPT="$MANAGER_DIR/apply-firewall.sh"
 FIREWALL_SERVICE="/etc/systemd/system/ikev2-manager-firewall.service"
@@ -49,10 +52,12 @@ fi
 # Defaults for v1 fixed scenario
 DEFAULT_CONN_NAME="ikev2-eap"
 DEFAULT_CERT_NAME="ikev2.pem"
-DEFAULT_CERT_PATH="/etc/swanctl/x509/ikev2.pem"
-DEFAULT_CA_PATH="/etc/swanctl/x509ca/issuer-ca.pem"
-DEFAULT_KEY_PATH="/etc/swanctl/private/ikev2.key"
-CA_CHAIN_PREFIX="/etc/swanctl/x509ca/ikev2-chain"
+DEFAULT_CERT_PATH="$SWANCTL_X509_DIR/ikev2.pem"
+DEFAULT_CA_PATH="$MANAGER_DIR/issuer-chain.pem"
+LEGACY_CA_PATH="$SWANCTL_X509CA_DIR/issuer-ca.pem"
+DEFAULT_KEY_PATH="$SWANCTL_PRIVATE_DIR/ikev2.key"
+CA_CHAIN_PREFIX="$SWANCTL_X509_DIR/ikev2-issuer"
+CA_ROOT_PATH="$SWANCTL_X509CA_DIR/ikev2-root.pem"
 DEFAULT_POOL_RANGE="10.20.20.10-10.20.20.250"
 DEFAULT_POOL_CIDR="10.20.20.0/24"
 # IPv6 behavior: block = clients tunnel IPv6 and the server drops it (no
@@ -97,6 +102,9 @@ load_config() {
   CERT_NAME="${CERT_NAME:-$DEFAULT_CERT_NAME}"
   CERT_PATH="${CERT_PATH:-$DEFAULT_CERT_PATH}"
   CA_PATH="${CA_PATH:-$DEFAULT_CA_PATH}"
+  if [[ "$CA_PATH" == "$LEGACY_CA_PATH" ]]; then
+    CA_PATH="$DEFAULT_CA_PATH"
+  fi
   KEY_PATH="${KEY_PATH:-$DEFAULT_KEY_PATH}"
   VPN_POOL_RANGE="${VPN_POOL_RANGE:-$DEFAULT_POOL_RANGE}"
   VPN_POOL_CIDR="${VPN_POOL_CIDR:-$DEFAULT_POOL_CIDR}"
@@ -813,8 +821,15 @@ ask_acme_provider_env() {
 }
 backup_file() {
   local target="$1"
+  local backup_dir backup_name
   [[ -f "$target" ]] || return 0
-  cp -a "$target" "${target}.bak.$(date +%Y%m%d-%H%M%S)"
+  backup_dir="$MANAGER_DIR/backups"
+  backup_name="${target#/}"
+  backup_name="${backup_name//\//_}"
+  ensure_manager_dir
+  mkdir -p "$backup_dir"
+  chmod 700 "$backup_dir"
+  cp -a "$target" "$backup_dir/${backup_name}.bak.$(date +%Y%m%d-%H%M%S)"
 }
 
 write_certificate_reload_script() {
@@ -826,11 +841,39 @@ umask 077
 
 ca_bundle='${CA_PATH}'
 chain_prefix='${CA_CHAIN_PREFIX}'
+root_path='${CA_ROOT_PATH}'
+cert_path='${CERT_PATH}'
+legacy_ca_bundle='${LEGACY_CA_PATH}'
 swanctl_conf='${SWANCTL_CONF}'
 service_name='$(detect_service_name)'
+backup_dir='${MANAGER_DIR}/backups/credentials'
+x509_dir='${SWANCTL_X509_DIR}'
+x509ca_dir='${SWANCTL_X509CA_DIR}'
+private_dir='${SWANCTL_PRIVATE_DIR}'
 
 [[ -s "\$ca_bundle" ]]
-rm -f "\${chain_prefix}"-*.pem
+mkdir -p "\$backup_dir"
+chmod 700 "\$backup_dir"
+
+for directory in "\$x509_dir" "\$x509ca_dir" "\$private_dir"; do
+  while IFS= read -r backup; do
+    name="\${directory##*/}-\${backup##*/}"
+    mv "\$backup" "\$backup_dir/\$name"
+  done < <(find "\$directory" -maxdepth 1 -type f -name '*.bak.*' -print)
+done
+
+if [[ -f "\$legacy_ca_bundle" && "\$legacy_ca_bundle" != "\$ca_bundle" ]]; then
+  mv "\$legacy_ca_bundle" "\$backup_dir/legacy-issuer-ca.pem"
+fi
+for old_chain in "\$x509ca_dir"/ikev2-chain-*.pem; do
+  [[ -f "\$old_chain" ]] || continue
+  mv "\$old_chain" "\$backup_dir/\${old_chain##*/}"
+done
+
+for old_chain in "\${chain_prefix}"-*.pem; do
+  [[ -f "\$old_chain" ]] || continue
+  mv "\$old_chain" "\$backup_dir/\${old_chain##*/}.old"
+done
 awk -v prefix="\$chain_prefix" '
   /-----BEGIN CERTIFICATE-----/ {
     count++
@@ -845,30 +888,28 @@ awk -v prefix="\$chain_prefix" '
 ' "\$ca_bundle"
 chmod 644 "\${chain_prefix}"-*.pem
 
-chain_names=""
+last_chain=""
 for file in "\${chain_prefix}"-*.pem; do
   [[ -f "\$file" ]] || continue
-  [[ -z "\$chain_names" ]] || chain_names+=", "
-  chain_names+="\$(basename "\$file")"
+  last_chain="\$file"
 done
+[[ -n "\$last_chain" ]]
 
-if [[ -f "\$swanctl_conf" && -n "\$chain_names" ]]; then
+issuer_hash="\$(openssl x509 -in "\$last_chain" -noout -issuer_hash)"
+system_root="/etc/ssl/certs/\${issuer_hash}.0"
+[[ -f "\$system_root" ]]
+root_tmp="\${root_path}.tmp.\$\$"
+cp -L "\$system_root" "\$root_tmp"
+chmod 644 "\$root_tmp"
+mv -f "\$root_tmp" "\$root_path"
+
+openssl verify -CAfile "\$root_path" -untrusted "\$ca_bundle" \
+  "\$cert_path" >/dev/null
+
+if [[ -f "\$swanctl_conf" ]]; then
   config_tmp="\${swanctl_conf}.tmp.\$\$"
-  awk -v replacement="      cacerts = \$chain_names" '
-    /^[[:space:]]*cacerts[[:space:]]*=/ {
-      print replacement
-      inserted = 1
-      next
-    }
-    {
-      print
-      if (!inserted && \$0 ~ /^[[:space:]]+certs[[:space:]]*=/) {
-        print replacement
-        inserted = 1
-      }
-    }
-    END { if (!inserted) exit 1 }
-  ' "\$swanctl_conf" >"\$config_tmp"
+  awk '!/^[[:space:]]*cacerts[[:space:]]*=/' \
+    "\$swanctl_conf" >"\$config_tmp"
   chmod 600 "\$config_tmp"
   mv -f "\$config_tmp" "\$swanctl_conf"
 fi
@@ -880,18 +921,6 @@ if systemctl is-active --quiet "\${service_name}.service"; then
 fi
 EOF_RELOAD
   chmod 700 "$CERT_RELOAD_SCRIPT"
-}
-
-ca_chain_config_names() {
-  local file names=""
-  for file in "${CA_CHAIN_PREFIX}"-*.pem; do
-    [[ -f "$file" ]] || continue
-    if [[ -n "$names" ]]; then
-      names+=", "
-    fi
-    names+="$(basename "$file")"
-  done
-  printf '%s' "$names"
 }
 
 ensure_packages() {
@@ -1247,7 +1276,8 @@ cleanup_acme_binding() {
 
 cleanup_managed_files() {
   rm -f "$SWANCTL_CONF" "$CERT_PATH" "$CA_PATH" "$KEY_PATH"
-  rm -f "${CA_CHAIN_PREFIX}"-*.pem "$CERT_RELOAD_SCRIPT"
+  rm -f "$LEGACY_CA_PATH" "$CA_ROOT_PATH" "$CERT_RELOAD_SCRIPT"
+  rm -f "${CA_CHAIN_PREFIX}"-*.pem /etc/swanctl/x509ca/ikev2-chain-*.pem
   rm -f "${CERT_PATH}".bak.* "${CA_PATH}".bak.* "${KEY_PATH}".bak.* "${SWANCTL_CONF}".bak.* 2>/dev/null || true
   rm -f /etc/swanctl/conf.d/*.conf 2>/dev/null || true
   rmdir /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private /etc/swanctl/conf.d /etc/swanctl 2>/dev/null || true
@@ -1395,11 +1425,6 @@ generate_swanctl_conf() {
   # In block/nat modes clients get an IPv6 address and a ::/0 selector, so
   # dual-stack devices route IPv6 into the tunnel instead of leaking it.
   local effective_local_ts="$LOCAL_TS" pool_list="vpn_pool" pool6_block=""
-  local ca_chain_names ca_chain_line=""
-  ca_chain_names="$(ca_chain_config_names)"
-  if [[ -n "$ca_chain_names" ]]; then
-    ca_chain_line="      cacerts = ${ca_chain_names}"
-  fi
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
     if [[ ",$LOCAL_TS," != *",::/0,"* ]]; then
       effective_local_ts="${LOCAL_TS},::/0"
@@ -1427,7 +1452,6 @@ connections {
       auth = pubkey
       certs = ${CERT_NAME}
       id = ${DOMAIN}
-${ca_chain_line}
     }
 
     remote {
@@ -3088,6 +3112,7 @@ reissue_certificate() {
     pause
     return 1
   fi
+  save_config
   if ! reload_vpn_credentials; then
     echo "VPN credentials reload failed after certificate update."
     pause

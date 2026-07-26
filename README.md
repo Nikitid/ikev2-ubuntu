@@ -13,7 +13,7 @@
 ## Состояние
 
 Поддерживаются Ubuntu 22.04 LTS и 24.04 LTS. Актуальная стабильная версия —
-`v1.3.1`.
+`v1.3.2`.
 
 ## Возможности
 
@@ -37,7 +37,7 @@
 Стабильный релиз:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.1/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.2/scripts/ikev2-manager.sh)
 ```
 
 Текущая ветка `main`:
@@ -62,10 +62,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/main/sc
 ### Ошибка Windows 13801 после обновления сертификата
 
 Новые цепочки Let’s Encrypt могут содержать несколько промежуточных
-сертификатов. Менеджер разделяет CA bundle на отдельные PEM-файлы, чтобы
-strongSwan загрузил и отправил полную цепочку. После обновления старой
-установки повторно выпустите сертификат через сервисное меню и проверьте
-`Loaded CA chain files` в диагностике.
+сертификатов. Менеджер загружает их как недоверенные промежуточные сертификаты,
+а системный корень — как trust anchor. Это заставляет strongSwan отправлять
+полную цепочку в IKE_AUTH. После обновления старой установки повторно выпустите
+сертификат через сервисное меню и проверьте `Loaded CA chain files` в
+диагностике.
 
 ## Разработка
 

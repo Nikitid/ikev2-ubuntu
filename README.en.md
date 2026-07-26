@@ -12,7 +12,7 @@ ACME certificates, EAP-MSCHAPv2 users, and firewall rules.
 ## Status
 
 Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
-`v1.3.1`.
+`v1.3.2`.
 
 ## Features
 
@@ -36,7 +36,7 @@ Ubuntu 22.04 LTS and 24.04 LTS are supported. The current stable release is
 Pinned stable release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.1/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.2/scripts/ikev2-manager.sh)
 ```
 
 Current `main` branch:
@@ -60,10 +60,10 @@ The script opens an interactive menu. Managed state is stored under
 ### Windows error 13801 after certificate renewal
 
 New Let's Encrypt chains may contain multiple intermediate certificates. The
-manager splits the CA bundle into separate PEM files so strongSwan loads and
-sends the complete chain. After updating an existing installation, reissue the
-certificate from the service menu and check `Loaded CA chain files` in
-diagnostics.
+manager loads them as untrusted intermediate certificates and loads the system
+root as the trust anchor. This makes strongSwan send the complete chain in
+IKE_AUTH. After updating an existing installation, reissue the certificate
+from the service menu and check `Loaded CA chain files` in diagnostics.
 
 ## Development
 
