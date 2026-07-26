@@ -154,6 +154,7 @@ MOCK_CONNTRACK_COUNT=100
 MOCK_CONNTRACK_MAX=7680
 # shellcheck disable=SC2329 # Invoked indirectly by conntrack_status.
 sysctl() {
+  # shellcheck disable=SC2317 # Function body is invoked indirectly.
   case "${2:-}" in
     net.netfilter.nf_conntrack_count) printf '%s\n' "$MOCK_CONNTRACK_COUNT" ;;
     net.netfilter.nf_conntrack_max) printf '%s\n' "$MOCK_CONNTRACK_MAX" ;;
