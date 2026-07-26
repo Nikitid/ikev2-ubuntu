@@ -144,6 +144,33 @@ assert_eq "ensure_apple_esp_proposals strips spaces and avoids duplicates" \
   "aes256gcm16,aes256gcm16-ecp256,aes256gcm16-modp2048" \
   "$(ensure_apple_esp_proposals "aes256gcm16, aes256gcm16-ecp256")"
 
+# conntrack_target_max
+assert_eq "conntrack target raises a low limit" "32768" "$(conntrack_target_max 7680)"
+assert_eq "conntrack target keeps the minimum" "32768" "$(conntrack_target_max 32768)"
+assert_eq "conntrack target preserves a higher limit" "65536" "$(conntrack_target_max 65536)"
+assert_eq "conntrack target handles unavailable input" "32768" "$(conntrack_target_max unavailable)"
+
+MOCK_CONNTRACK_COUNT=100
+MOCK_CONNTRACK_MAX=7680
+# shellcheck disable=SC2329 # Invoked indirectly by conntrack_status.
+sysctl() {
+  case "${2:-}" in
+    net.netfilter.nf_conntrack_count) printf '%s\n' "$MOCK_CONNTRACK_COUNT" ;;
+    net.netfilter.nf_conntrack_max) printf '%s\n' "$MOCK_CONNTRACK_MAX" ;;
+    *) return 1 ;;
+  esac
+}
+assert_eq "conntrack status flags a low limit" \
+  "100/7680 (1%); limit below 32768" "$(conntrack_status)"
+MOCK_CONNTRACK_COUNT=22938
+MOCK_CONNTRACK_MAX=32768
+assert_eq "conntrack status warns at 70 percent" \
+  "22938/32768 (70%); warning" "$(conntrack_status)"
+MOCK_CONNTRACK_COUNT=29492
+assert_eq "conntrack status is critical at 90 percent" \
+  "29492/32768 (90%); critical" "$(conntrack_status)"
+unset -f sysctl
+
 # valid_port / valid_port_list / normalize_port_list
 assert_ok "valid_port accepts 22" valid_port "22"
 assert_ok "valid_port accepts 65535" valid_port "65535"

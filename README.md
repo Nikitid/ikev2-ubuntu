@@ -13,7 +13,7 @@
 ## Состояние
 
 Поддерживаются Ubuntu 22.04 LTS и 24.04 LTS. Актуальная стабильная версия —
-`v1.3.0`.
+`v1.3.1`.
 
 ## Возможности
 
@@ -37,7 +37,7 @@
 Стабильный релиз:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.1/scripts/ikev2-manager.sh)
 ```
 
 Текущая ветка `main`:
