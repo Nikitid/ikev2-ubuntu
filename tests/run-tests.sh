@@ -176,6 +176,13 @@ assert_fail "valid_group_name rejects space" valid_group_name "team 1"
 assert_ok "valid_dns_provider accepts dns_timeweb" valid_dns_provider "dns_timeweb"
 assert_fail "valid_dns_provider rejects shell metachars" valid_dns_provider "dns;rm"
 
+# acme_mode_from_choice
+assert_eq "ACME selector maps 1 to DNS-01" "dns-01" "$(acme_mode_from_choice 1)"
+assert_eq "ACME selector maps dns to DNS-01" "dns-01" "$(acme_mode_from_choice dns)"
+assert_eq "ACME selector maps 2 to HTTP-01" "http-01" "$(acme_mode_from_choice 2)"
+assert_eq "ACME selector maps http-01 to HTTP-01" "http-01" "$(acme_mode_from_choice http-01)"
+assert_fail "ACME selector rejects unknown choice" acme_mode_from_choice 3
+
 # normalize_platform / valid_platform
 assert_eq "normalize_platform Win -> windows" "windows" "$(normalize_platform "Win")"
 assert_eq "normalize_platform iPhone -> ios" "ios" "$(normalize_platform "iPhone")"

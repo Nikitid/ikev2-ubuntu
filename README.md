@@ -1,9 +1,9 @@
-# IKEv2 Manager for Ubuntu
+# ikev2-ubuntu
 
 [English](README.en.md)
 
 [![Лицензия: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Проверки](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml/badge.svg)](https://github.com/Nikitid/ikev2-manager/actions/workflows/check.yml)
+[![Проверки](https://github.com/Nikitid/ikev2-ubuntu/actions/workflows/check.yml/badge.svg)](https://github.com/Nikitid/ikev2-ubuntu/actions/workflows/check.yml)
 
 Интерактивный Bash-скрипт для установки и обслуживания IKEv2/IPsec-сервера
 на Ubuntu. Проект рассчитан на один сервер и использует strongSwan с
@@ -23,7 +23,7 @@
 - IPv4 full tunnel, защита от утечек IPv6 или NAT66;
 - изоляция VPN-клиентов и ограничение входящего трафика;
 - диагностика, журналы, управление службами и обновление сертификатов;
-- дополнительное управление MTProto-прокси ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT) и 3x-ui.
+- дополнительное управление MTProto-прокси ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT).
 
 ## Требования
 
@@ -37,13 +37,13 @@
 Стабильный релиз:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/v1.3.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.3.0/scripts/ikev2-manager.sh)
 ```
 
 Текущая ветка `main`:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/main/scripts/ikev2-manager.sh)
 ```
 
 Перед запуском удаленного скрипта рекомендуется проверить его содержимое и
@@ -58,6 +58,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-manager/main/s
 - Для `http-01` во время выпуска сертификата необходим входящий TCP-порт `80`.
 - Для `dns-01` потребуются учетные данные выбранного DNS-провайдера.
 - Пароли VPN и экспортированные клиентские наборы содержат секреты.
+
+### Ошибка Windows 13801 после обновления сертификата
+
+Новые цепочки Let’s Encrypt могут содержать несколько промежуточных
+сертификатов. Менеджер разделяет CA bundle на отдельные PEM-файлы, чтобы
+strongSwan загрузил и отправил полную цепочку. После обновления старой
+установки повторно выпустите сертификат через сервисное меню и проверьте
+`Loaded CA chain files` в диагностике.
 
 ## Разработка
 
