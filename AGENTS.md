@@ -5,10 +5,20 @@
 This repository contains a Bash manager for an IKEv2 server on supported Ubuntu
 LTS releases. Keep changes compatible with the existing single-script design.
 
+## Start of Work
+
+- Read `docs/MAP.md` first. Locate a function with
+  `grep -n <name> docs/INDEX.md` rather than reading the manager script whole:
+  it is 4399 lines.
+- Do not read `CHANGELOG.md` for orientation; it is release history.
+- Run `git status -sb` and preserve unrelated changes.
+
 ## Structure
 
 - `scripts/ikev2-manager.sh` — installer and interactive manager.
 - `tests/run-tests.sh` — tests for sourceable helper functions.
+- `docs/INDEX.md` — generated function index; regenerate with
+  `scripts/gen-index.sh` after adding or renaming a function.
 - `.github/workflows/check.yml` — shell validation in GitHub Actions.
 
 ## Working rules
