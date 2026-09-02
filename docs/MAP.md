@@ -51,4 +51,3 @@ there, not here.
 | `docs/INDEX.md` | generated function index; grep it |
 | `README.md` | operator-facing, Russian |
 | `README.en.md` | the English version |
-| `CHANGELOG.md` | release history - not onboarding material |
