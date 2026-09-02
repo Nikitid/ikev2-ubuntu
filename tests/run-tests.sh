@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Unit tests for pure helper functions in scripts/ikev2-manager.sh.
 # The manager script only runs main() when executed directly, so it is safe to source.
+#
+# Fixture assignments below are read by the sourced manager functions, not by
+# this file, which is what SC2034 flags.
+# shellcheck disable=SC2034
 
 set -u
 
@@ -227,6 +231,148 @@ assert_eq "escape_swanctl escapes quotes" 'a\"b' "$(escape_swanctl 'a"b')"
 assert_eq "escape_swanctl escapes backslash" 'a\\b' "$(escape_swanctl 'a\b')"
 assert_eq "html_escape escapes markup" "&lt;b&gt;&amp;&quot;" "$(html_escape '<b>&"')"
 assert_eq "trim strips whitespace" "abc" "$(trim "  abc  ")"
+
+# valid_egress_policy / valid_cert_key_type / valid_ike_unique
+assert_ok "valid_egress_policy accepts internet-only" valid_egress_policy "internet-only"
+assert_ok "valid_egress_policy accepts open" valid_egress_policy "open"
+assert_fail "valid_egress_policy rejects unknown" valid_egress_policy "all"
+assert_ok "valid_cert_key_type accepts ec256" valid_cert_key_type "ec256"
+assert_fail "valid_cert_key_type rejects rsa1024" valid_cert_key_type "rsa1024"
+assert_ok "valid_ike_unique accepts replace" valid_ike_unique "replace"
+assert_fail "valid_ike_unique rejects always" valid_ike_unique "always"
+
+# acme_keylength_for
+assert_eq "acme_keylength_for rsa2048" "2048" "$(acme_keylength_for rsa2048)"
+assert_eq "acme_keylength_for ec256" "ec-256" "$(acme_keylength_for ec256)"
+assert_fail "acme_keylength_for rejects unknown" acme_keylength_for "rsa1024"
+
+# cidr_overlaps
+assert_ok "cidr_overlaps 10.20.20.0/24 inside 10.0.0.0/8" cidr_overlaps "10.20.20.0/24" "10.0.0.0/8"
+assert_ok "cidr_overlaps is symmetric" cidr_overlaps "10.0.0.0/8" "10.20.20.0/24"
+assert_fail "cidr_overlaps separate networks" cidr_overlaps "10.20.20.0/24" "192.168.1.0/24"
+assert_ok "cidr_overlaps default route covers everything" cidr_overlaps "10.20.20.0/24" "0.0.0.0/0"
+
+# conntrack_target_max
+assert_eq "conntrack_target_max raises a low limit" "32768" "$(conntrack_target_max 7680)"
+assert_eq "conntrack_target_max keeps a higher limit" "262144" "$(conntrack_target_max 262144)"
+assert_eq "conntrack_target_max handles garbage" "32768" "$(conntrack_target_max "")"
+
+# supported releases
+assert_eq "supported_os_list lists tested releases" "22.04 24.04 26.04" "$(supported_os_list)"
+
+# ---------------------------------------------------------------------------
+# Helpers that read the user database and the proxy configuration. They are
+# not pure, so they run against fixtures in a temporary directory.
+# ---------------------------------------------------------------------------
+FIXTURE_DIR="$(mktemp -d)"
+trap 'rm -rf "$FIXTURE_DIR"' EXIT
+
+USERS_DB="$FIXTURE_DIR/users.db"
+MANAGER_DIR="$FIXTURE_DIR"
+cat >"$USERS_DB" <<'FIXTURE_DB'
+alice-pc|pw-alice|my-team|windows
+bob-phone|pw-bob|my-team|ios
+carl-pc|pw-carl|solo|windows
+dana-pc|pw-dana|solo|ios
+eve-pc|pw-eve||windows
+FIXTURE_DB
+
+# list_groups must not truncate an explicit hyphenated group name, and falls
+# back to the username prefix only when the group field is empty.
+assert_eq "list_groups keeps hyphenated groups" "eve
+my-team
+solo" "$(list_groups)"
+
+# select_group_prompt is consumed through a command substitution, so its
+# prompt and listing must not reach stdout.
+assert_eq "select_group_prompt returns only the group by number" "my-team" \
+  "$(printf '2\n' | select_group_prompt 2>/dev/null)"
+assert_eq "select_group_prompt returns only the group by name" "solo" \
+  "$(printf 'solo\n' | select_group_prompt 2>/dev/null)"
+assert_fail "select_group_prompt rejects an unknown group" \
+  bash -c 'printf "nope\n" | select_group_prompt' 2>/dev/null
+
+assert_eq "get_group_users filters by group and platform" "bob-phone|pw-bob|my-team|ios" \
+  "$(get_group_users "my-team" "ios")"
+
+MT_CONFIG_FILE="$FIXTURE_DIR/config.toml"
+cat >"$MT_CONFIG_FILE" <<'FIXTURE_TOML'
+[server]
+port = 1443
+max_connections = 512
+
+[censorship]
+tls_domain = "rutube.ru"
+mask = true
+mask_port = 8443
+
+[access.users]
+alice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+bob = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+FIXTURE_TOML
+
+assert_eq "mt_user_secret returns the requested user" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+  "$(mt_user_secret bob)"
+assert_eq "mt_user_secret falls back to the first user" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  "$(mt_user_secret "")"
+assert_eq "mt_user_secret is empty for an unknown user" "" "$(mt_user_secret nobody)"
+assert_eq "mt_list_users lists proxy users" "alice
+bob" "$(mt_list_users)"
+
+# mask_port lives in another section and must not be read as the listen port.
+mt_load_config
+assert_eq "mt_load_config reads the server port" "1443" "$MT_PORT"
+assert_eq "mt_load_config reads the TLS domain" "rutube.ru" "$MT_TLS_DOMAIN"
+
+# ---------------------------------------------------------------------------
+# Generated artifacts.
+# ---------------------------------------------------------------------------
+FIREWALL_SCRIPT="$FIXTURE_DIR/apply-firewall.sh"
+VPN_POOL_CIDR="10.20.20.0/24"
+VPN_POOL6_CIDR="fd42:4242:4242:1::/112"
+UPLINK_IF="eth0"
+IPV6_MODE="nat"
+CLIENT_ISOLATION="1"
+EGRESS_POLICY="internet-only"
+VPN_DNS="1.1.1.1,192.168.1.53"
+ACME_MODE="http-01"
+EGRESS_HOST_TCP_PORTS="2002"
+EGRESS_HOST_UDP_PORTS=""
+HARDEN_INPUT="1"
+HARDEN_TCP_PORTS=""
+HARDEN_UDP_PORTS=""
+write_firewall_script
+
+assert_ok "generated firewall script is valid bash" bash -n "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script carries the version marker" \
+  grep -qF "$GENERATED_TAG: v$SCRIPT_VERSION" "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script opens TCP/80 for HTTP-01 renewal" \
+  grep -q -- '--dport 80 -j ACCEPT' "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script allows DHCPv4 replies" \
+  grep -q -- '--dport 68 -j ACCEPT' "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script blocks cloud metadata" \
+  grep -q '169.254.0.0/16' "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script bakes in the SSH ports" \
+  grep -q "^HARDEN_SSH_PORTS=" "$FIREWALL_SCRIPT"
+assert_ok "generated firewall script keeps allowed host ports reachable" \
+  grep -q "^EGRESS_HOST_TCP_PORTS='2002'" "$FIREWALL_SCRIPT"
+# Dumping the live ruleset would persist rules owned by Docker or ufw.
+if grep -qE 'iptables-save|netfilter-persistent save' "$FIREWALL_SCRIPT"; then
+  fail "generated firewall script must not persist the ambient ruleset"
+else
+  pass
+fi
+if grep -qE 'iptables-save|netfilter-persistent save' "$TESTS_DIR/../scripts/ikev2-manager.sh"; then
+  fail "manager must not persist the ambient ruleset"
+else
+  pass
+fi
+
+# generated_is_current must notice files written by another version.
+assert_ok "generated_is_current accepts a current file" generated_is_current "$FIREWALL_SCRIPT"
+printf '#!/usr/bin/env bash\n# %s: v0.0.1\n' "$GENERATED_TAG" >"$FIXTURE_DIR/stale.sh"
+assert_fail "generated_is_current rejects an older file" generated_is_current "$FIXTURE_DIR/stale.sh"
+assert_fail "generated_is_current rejects a missing file" generated_is_current "$FIXTURE_DIR/absent.sh"
 
 if grep -q -- '--clear-creds' "$TESTS_DIR/../scripts/ikev2-manager.sh"; then
   fail "swanctl reload must use supported --clear option"

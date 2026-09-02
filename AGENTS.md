@@ -20,7 +20,13 @@ LTS releases. Keep changes compatible with the existing single-script design.
   private keys, exports, or files from `/opt/ikev2-manager`.
 - Treat firewall, routing, certificate, user database, and uninstall paths as
   security-sensitive.
-- Preserve support for Ubuntu 22.04 and 24.04 unless the task changes it.
+- Preserve support for the Ubuntu releases listed in
+  `SUPPORTED_UBUNTU_VERSIONS` unless the task changes it.
+- Generated artifacts (firewall script, sysctl, certificate helpers) must
+  carry the `GENERATED_TAG` version marker so an upgrade can detect and
+  regenerate files written by an older version.
+- Firewall rules must stay idempotent (check-then-act) and must never persist
+  the ambient ruleset: other software owns rules on the same host.
 
 ## Validation
 
