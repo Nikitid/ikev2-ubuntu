@@ -1,16 +1,28 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -Euo pipefail
 # Bash 5.2+ expands & in ${var//pat/repl} to the match by default,
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.4.0"
+# Schema version of $CONFIG_FILE; migrate_config() upgrades older files.
+CONFIG_VERSION="2"
+# Marker written into every generated file so a newer script can detect and
+# regenerate artifacts left behind by an older version.
+GENERATED_TAG="ikev2-manager generated"
 MANAGER_DIR="/opt/ikev2-manager"
 CONFIG_FILE="$MANAGER_DIR/config.env"
 ACME_ENV_FILE="$MANAGER_DIR/acme.env"
 USERS_DB="$MANAGER_DIR/users.db"
 EXPORTS_DIR="$MANAGER_DIR/exports"
 CERT_RELOAD_SCRIPT="$MANAGER_DIR/reload-certificate.sh"
+CERT_CHECK_SCRIPT="$MANAGER_DIR/check-certificate.sh"
+CERT_CHECK_SERVICE="/etc/systemd/system/ikev2-manager-certcheck.service"
+CERT_CHECK_TIMER="/etc/systemd/system/ikev2-manager-certcheck.timer"
+MODULES_LOAD_FILE="/etc/modules-load.d/ikev2-manager.conf"
+# Number of generations kept per backed up file; older copies hold private
+# key material and are pruned.
+BACKUP_KEEP="5"
 
 # MTProto proxy manager paths
 # Backend: mtproto.zig by Aleksandr Kalashnikov (sleep3r)
@@ -23,18 +35,32 @@ MT_SERVICE_FILE="/etc/systemd/system/${MT_SERVICE}.service"
 MT_DEFAULT_PORT="443"
 MT_DEFAULT_TLS_DOMAIN="rutube.ru"
 MT_BOOTSTRAP_URL="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
+# Optional pin: set to the expected sha256 of the bootstrap script to install
+# without the interactive fingerprint confirmation.
+MT_BOOTSTRAP_SHA256=""
 
 SWANCTL_CONF="/etc/swanctl/swanctl.conf"
 SWANCTL_X509_DIR="/etc/swanctl/x509"
 SWANCTL_X509CA_DIR="/etc/swanctl/x509ca"
 SWANCTL_PRIVATE_DIR="/etc/swanctl/private"
 SYSCTL_FILE="/etc/sysctl.d/99-ikev2-manager.conf"
+# Netfilter chains owned by this manager.
+HARDEN_CHAIN="IKEV2_MGR_IN"
+EGRESS_CHAIN="IKEV2_MGR_FWD"
+HOST_CHAIN="IKEV2_MGR_HOST"
 FIREWALL_SCRIPT="$MANAGER_DIR/apply-firewall.sh"
 FIREWALL_SERVICE="/etc/systemd/system/ikev2-manager-firewall.service"
 ACME_HOME="/root/.acme.sh"
 ACME_BIN="$ACME_HOME/acme.sh"
+# acme.sh is installed from a pinned upstream tag; the unpinned installer is
+# only used as a fallback and requires an explicit confirmation.
+ACME_VERSION="3.1.0"
+ACME_INSTALLER_URL="https://raw.githubusercontent.com/acmesh-official/acme.sh/${ACME_VERSION}/acme.sh"
+ACME_INSTALLER_FALLBACK_URL="https://get.acme.sh"
 SERVICE_NAME=""
 LAST_ERROR=""
+# Set by the non-interactive subcommands so prompts are skipped.
+NONINTERACTIVE=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -75,11 +101,41 @@ DEFAULT_LOCAL_TS="0.0.0.0/0"
 DEFAULT_CLIENT_ISOLATION="1"
 # Inbound hardening appends a default-drop allowlist chain to INPUT.
 DEFAULT_HARDEN_INPUT="0"
+# Egress policy for the client pool. internet-only drops traffic aimed at
+# link-local/metadata and private networks (and at this host itself), open
+# keeps the historic behaviour of routing everything.
+DEFAULT_EGRESS_POLICY="internet-only"
+# Networks a VPN client must not reach through the tunnel under
+# internet-only. Configured client DNS servers are exempted at rule build
+# time so a resolver on a private network keeps working.
+EGRESS_BLOCKED_V4="169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 127.0.0.0/8"
+EGRESS_BLOCKED_V6="fe80::/10 fc00::/7 ::1/128"
+# Ports on the VPN host itself that clients may still reach under
+# internet-only (for example SSH administered over the tunnel). DNS is
+# always allowed so a resolver running on the host keeps working.
+DEFAULT_EGRESS_HOST_TCP_PORTS=""
+DEFAULT_EGRESS_HOST_UDP_PORTS=""
+DEFAULT_CERT_KEY_TYPE="rsa2048"
+# unique = never keeps historic behaviour: several parallel sessions per
+# identity. replace disconnects the previous session of the same identity.
+DEFAULT_IKE_UNIQUE="never"
 # Keep enough conntrack capacity for short NAT/VPN traffic bursts on small VPS
 # instances. Existing higher administrator-defined limits are preserved.
 MIN_CONNTRACK_MAX="32768"
+# Ubuntu LTS releases this script is tested against.
+SUPPORTED_UBUNTU_VERSIONS=("22.04" "24.04" "26.04")
 
-trap 'LAST_ERROR="Command failed on line $LINENO"' ERR
+# The menu header shows the failure of the most recent action. Errors are
+# recorded explicitly by report_error() where they are reported: a global ERR
+# trap also caught benign non-zero statuses (an empty grep, a missing
+# interface) and turned them into misleading "last error" lines.
+
+# Reports a failure to the operator and remembers it for the menu header.
+report_error() {
+  local message="$1"
+  LAST_ERROR="$message"
+  echo "$message"
+}
 
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -122,9 +178,26 @@ load_config() {
   HARDEN_INPUT="${HARDEN_INPUT:-$DEFAULT_HARDEN_INPUT}"
   HARDEN_TCP_PORTS="${HARDEN_TCP_PORTS:-}"
   HARDEN_UDP_PORTS="${HARDEN_UDP_PORTS:-}"
+  EGRESS_POLICY="${EGRESS_POLICY:-$DEFAULT_EGRESS_POLICY}"
+  EGRESS_HOST_TCP_PORTS="${EGRESS_HOST_TCP_PORTS:-$DEFAULT_EGRESS_HOST_TCP_PORTS}"
+  EGRESS_HOST_UDP_PORTS="${EGRESS_HOST_UDP_PORTS:-$DEFAULT_EGRESS_HOST_UDP_PORTS}"
+  CERT_KEY_TYPE="${CERT_KEY_TYPE:-$DEFAULT_CERT_KEY_TYPE}"
+  IKE_UNIQUE="${IKE_UNIQUE:-$DEFAULT_IKE_UNIQUE}"
+  MANAGED_PACKAGES="${MANAGED_PACKAGES:-}"
   UPLINK_IF="${UPLINK_IF:-$(detect_uplink_if || true)}"
   UPLINK_IF="${UPLINK_IF:-}"
   INSTALLED="${INSTALLED:-0}"
+  CONFIG_SCHEMA="${CONFIG_SCHEMA:-1}"
+}
+
+# Config files written before schema 2 simply lack the newer keys; the
+# defaults applied in load_config() are the migration. The stored schema
+# number is refreshed on the next save_config().
+migrate_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  [[ "${CONFIG_SCHEMA:-1}" != "$CONFIG_VERSION" ]] || return 0
+  CONFIG_SCHEMA="$CONFIG_VERSION"
+  save_config
 }
 
 effective_installed() {
@@ -158,17 +231,32 @@ save_config() {
     printf 'HARDEN_INPUT=%q\n' "${HARDEN_INPUT:-}"
     printf 'HARDEN_TCP_PORTS=%q\n' "${HARDEN_TCP_PORTS:-}"
     printf 'HARDEN_UDP_PORTS=%q\n' "${HARDEN_UDP_PORTS:-}"
+    printf 'EGRESS_POLICY=%q\n' "${EGRESS_POLICY:-$DEFAULT_EGRESS_POLICY}"
+    printf 'EGRESS_HOST_TCP_PORTS=%q\n' "${EGRESS_HOST_TCP_PORTS:-}"
+    printf 'EGRESS_HOST_UDP_PORTS=%q\n' "${EGRESS_HOST_UDP_PORTS:-}"
+    printf 'CERT_KEY_TYPE=%q\n' "${CERT_KEY_TYPE:-$DEFAULT_CERT_KEY_TYPE}"
+    printf 'IKE_UNIQUE=%q\n' "${IKE_UNIQUE:-$DEFAULT_IKE_UNIQUE}"
+    printf 'MANAGED_PACKAGES=%q\n' "${MANAGED_PACKAGES:-}"
+    printf 'CONFIG_SCHEMA=%q\n' "$CONFIG_VERSION"
   } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
 
 os_supported() {
   [[ -f /etc/os-release ]] || return 1
-  local os_id version_id
+  local os_id version_id supported
   os_id=$(awk -F= '/^ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release)
   version_id=$(awk -F= '/^VERSION_ID=/{gsub(/"/,"",$2); print $2}' /etc/os-release)
   [[ "$os_id" == "ubuntu" ]] || return 1
-  [[ "$version_id" == "22.04" || "$version_id" == "24.04" ]]
+  for supported in "${SUPPORTED_UBUNTU_VERSIONS[@]}"; do
+    [[ "$version_id" == "$supported" ]] && return 0
+  done
+  return 1
+}
+
+supported_os_list() {
+  local IFS=' '
+  printf '%s' "${SUPPORTED_UBUNTU_VERSIONS[*]}"
 }
 
 os_label() {
@@ -346,6 +434,31 @@ cidr_contains() {
   ((($(ip_to_int "$ip") & mask) == net))
 }
 
+# True when two IPv4 CIDRs share any address.
+cidr_overlaps() {
+  local a="$1" b="$2" a_prefix b_prefix prefix mask
+  a_prefix="${a#*/}"
+  b_prefix="${b#*/}"
+  prefix=$((a_prefix < b_prefix ? a_prefix : b_prefix))
+  if ((prefix == 0)); then
+    return 0
+  fi
+  mask=$(((0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF))
+  ((($(ip_to_int "${a%%/*}") & mask) == ($(ip_to_int "${b%%/*}") & mask)))
+}
+
+# Networks already configured on this host that would collide with the pool.
+conflicting_local_networks() {
+  local candidate cidr
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    valid_cidr "$candidate" || continue
+    if cidr_overlaps "$1" "$candidate"; then
+      printf '%s\n' "$candidate"
+    fi
+  done < <(ip -4 -o addr show 2>/dev/null | awk '{print $4}')
+}
+
 valid_ipv6() {
   local ip="$1" head tail g
   [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
@@ -484,6 +597,59 @@ valid_platform() {
   esac
 }
 
+valid_egress_policy() {
+  case "$1" in
+    internet-only | open) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_cert_key_type() {
+  case "$1" in
+    rsa2048 | rsa3072 | rsa4096 | ec256 | ec384) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# acme.sh spells key types differently from the config value.
+acme_keylength_for() {
+  case "$1" in
+    rsa2048) printf '2048' ;;
+    rsa3072) printf '3072' ;;
+    rsa4096) printf '4096' ;;
+    ec256) printf 'ec-256' ;;
+    ec384) printf 'ec-384' ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_ike_unique() {
+  case "$1" in
+    never | no | keep | replace) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+strongswan_version() {
+  local raw
+  raw="$(swanctl --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  [[ -n "$raw" ]] || return 1
+  printf '%s' "$raw"
+}
+
+# Compares the running strongSwan against major.minor.patch arguments.
+strongswan_at_least() {
+  local want_major="$1" want_minor="$2" want_patch="${3:-0}"
+  local version major minor patch
+  version="$(strongswan_version)" || return 1
+  IFS=. read -r major minor patch <<<"$version"
+  ((10#${major:-0} > want_major)) && return 0
+  ((10#${major:-0} < want_major)) && return 1
+  ((10#${minor:-0} > want_minor)) && return 0
+  ((10#${minor:-0} < want_minor)) && return 1
+  ((10#${patch:-0} >= want_patch))
+}
+
 infer_group_from_username() {
   local u="$1"
   u="${u%%-*}"
@@ -510,6 +676,15 @@ html_escape() {
   s="${s//>/&gt;}"
   s="${s//\"/&quot;}"
   printf '%s' "$s"
+}
+
+# Prints a multi-line value indented, one line per row.
+print_indented() {
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    printf '  %s\n' "$line"
+  done <<<"$1"
 }
 
 trim() {
@@ -613,7 +788,33 @@ has_isolation_rule() {
 }
 
 has_harden_chain() {
-  iptables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1
+  iptables -C INPUT -j "$HARDEN_CHAIN" >/dev/null 2>&1
+}
+
+has_egress_chain() {
+  iptables -C FORWARD -s "$VPN_POOL_CIDR" -j "$EGRESS_CHAIN" >/dev/null 2>&1
+}
+
+has_host_chain() {
+  iptables -C INPUT -s "$VPN_POOL_CIDR" -j "$HOST_CHAIN" >/dev/null 2>&1
+}
+
+# Rule helpers used by the manager itself (the generated firewall script
+# carries its own copies so it stays standalone).
+ipt_del_rule() {
+  local tool="$1" table="$2" chain="$3"
+  shift 3
+  while "$tool" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
+    "$tool" -t "$table" -D "$chain" "$@" || break
+  done
+}
+
+ipt_drop_chain() {
+  local tool="$1" parent="$2" chain="$3"
+  shift 3
+  ipt_del_rule "$tool" filter "$parent" "$@" -j "$chain"
+  "$tool" -F "$chain" 2>/dev/null || true
+  "$tool" -X "$chain" 2>/dev/null || true
 }
 
 status_line() {
@@ -639,6 +840,9 @@ read_menu_choice() {
   local __choice
   echo -en "${YELLOW}Select:${NC} "
   read -r __choice || true
+  # The header shows the error of the action that is about to run, not of an
+  # action several screens back.
+  LAST_ERROR=""
   printf -v "$__var" '%s' "$__choice"
 }
 
@@ -684,7 +888,7 @@ invalid_choice() {
 }
 
 render_header() {
-  clear
+  ((NONINTERACTIVE)) || clear
   load_config
 
   local install_state service_status cert_state users_state firewall_state auth_state quick_state topology_state os_state
@@ -752,6 +956,7 @@ render_header() {
   status_line "Auth:" "$auth_state"
   status_line "Pool / DNS:" "$quick_state"
   status_line "IPv6 mode:" "${IPV6_MODE:-off}"
+  status_line "Egress policy:" "${EGRESS_POLICY:-internet-only}"
   status_line "MTProto proxy:" "$(mt_service_status)"
   echo
   if [[ -n "$LAST_ERROR" ]]; then
@@ -759,6 +964,7 @@ render_header() {
   fi
 }
 pause() {
+  ((NONINTERACTIVE)) && return 0
   read -r -p "Press Enter to continue..." _
 }
 
@@ -775,13 +981,23 @@ ask() {
   fi
 }
 
+# Secrets must not end up in the terminal scrollback or in a recorded
+# session, so they are read without echo.
+ask_secret() {
+  local prompt="$1" answer
+  read -r -s -p "$prompt: " answer || true
+  echo >&2
+  printf '%s' "$answer"
+}
+
 ask_secret_multiline_generic() {
   local line
   echo -e "${YELLOW}Enter KEY=VALUE lines. Empty line finishes input.${NC}"
   : >"$ACME_ENV_FILE"
   chmod 600 "$ACME_ENV_FILE"
   while true; do
-    read -r -p "> " line || true
+    read -r -s -p "> " line || true
+    echo
     [[ -z "$line" ]] && break
     if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ ]]; then
       echo "Invalid format. Use KEY=VALUE."
@@ -804,7 +1020,7 @@ ask_acme_provider_env() {
     dns_timeweb)
       local token
       while true; do
-        read -r -p "Timeweb Cloud JWT token: " token || true
+        token="$(ask_secret "Timeweb Cloud JWT token")"
         [[ -n "$token" ]] && break
         echo "Token cannot be empty."
       done
@@ -830,14 +1046,60 @@ backup_file() {
   mkdir -p "$backup_dir"
   chmod 700 "$backup_dir"
   cp -a "$target" "$backup_dir/${backup_name}.bak.$(date +%Y%m%d-%H%M%S)"
+  prune_backups "$backup_dir" "${backup_name}.bak.*"
+}
+
+# Old certificates and private keys are liabilities; keep only the most
+# recent $BACKUP_KEEP generations of each backed up file.
+prune_backups() {
+  local backup_dir="$1" pattern="$2" file
+  [[ -d "$backup_dir" ]] || return 0
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    rm -f -- "$file"
+  done < <(find "$backup_dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -rn | tail -n "+$((BACKUP_KEEP + 1))" | cut -d' ' -f2-)
+}
+
+# Downloads a remote installer and refuses to run it unattended: the operator
+# sees the fingerprint of the exact bytes that are about to be executed.
+fetch_and_confirm_script() {
+  local url="$1" dest="$2" expected_sha="${3:-}" actual_sha ans
+
+  curl -fsSL "$url" -o "$dest" || return 1
+  [[ -s "$dest" ]] || return 1
+
+  actual_sha="$(sha256sum "$dest" 2>/dev/null | awk '{print $1}')"
+  if [[ -n "$expected_sha" ]]; then
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+      echo "Checksum mismatch for $url"
+      echo "expected: $expected_sha"
+      echo "actual:   $actual_sha"
+      return 1
+    fi
+    return 0
+  fi
+
+  echo
+  echo "About to execute a script downloaded from:"
+  echo "  $url"
+  echo "  sha256: ${actual_sha:-unavailable}"
+  echo "  size:   $(wc -c <"$dest") bytes"
+  read -r -p "Execute it? [y/N]: " ans || true
+  [[ "$ans" =~ ^[Yy]$ ]]
 }
 
 write_certificate_reload_script() {
   ensure_manager_dir
   cat >"$CERT_RELOAD_SCRIPT" <<EOF_RELOAD
 #!/usr/bin/env bash
+# ${GENERATED_TAG}: v${SCRIPT_VERSION}
 set -Eeuo pipefail
 umask 077
+
+# acme.sh runs this from cron with its output discarded, so a failure here
+# has to leave a trace in the journal instead of vanishing.
+trap 'logger -t ikev2-manager -p daemon.err "certificate reload failed (line \$LINENO: \$BASH_COMMAND)" 2>/dev/null || true' ERR
 
 ca_bundle='${CA_PATH}'
 chain_prefix='${CA_CHAIN_PREFIX}'
@@ -874,6 +1136,11 @@ for old_chain in "\${chain_prefix}"-*.pem; do
   [[ -f "\$old_chain" ]] || continue
   mv "\$old_chain" "\$backup_dir/\${old_chain##*/}.old"
 done
+
+# Old chains and keys accumulate on every renewal; keep a bounded history.
+find "\$backup_dir" -maxdepth 1 -type f -printf '%T@ %p\\n' 2>/dev/null \
+  | sort -rn | tail -n "+$((BACKUP_KEEP * 4 + 1))" | cut -d' ' -f2- \
+  | while IFS= read -r stale; do rm -f -- "\$stale"; done
 awk -v prefix="\$chain_prefix" '
   /-----BEGIN CERTIFICATE-----/ {
     count++
@@ -923,21 +1190,104 @@ EOF_RELOAD
   chmod 700 "$CERT_RELOAD_SCRIPT"
 }
 
+# acme.sh renews from cron with its output sent to /dev/null. A silent
+# renewal failure is invisible until clients stop connecting, so an
+# independent daily check reports the remaining lifetime to the journal.
+write_certificate_check_service() {
+  ensure_manager_dir
+  cat >"$CERT_CHECK_SCRIPT" <<EOF_CHECK
+#!/usr/bin/env bash
+# ${GENERATED_TAG}: v${SCRIPT_VERSION}
+set -Euo pipefail
+
+cert_path='${CERT_PATH}'
+warn_days=21
+critical_days=7
+
+if [[ ! -f "\$cert_path" ]]; then
+  logger -t ikev2-manager -p daemon.err "certificate missing: \$cert_path"
+  exit 1
+fi
+
+end_raw="\$(openssl x509 -in "\$cert_path" -noout -enddate 2>/dev/null | cut -d= -f2-)"
+if [[ -z "\$end_raw" ]]; then
+  logger -t ikev2-manager -p daemon.err "cannot read certificate expiry from \$cert_path"
+  exit 1
+fi
+
+end_epoch="\$(date -d "\$end_raw" +%s 2>/dev/null || true)"
+if [[ -z "\$end_epoch" ]]; then
+  logger -t ikev2-manager -p daemon.err "cannot parse certificate expiry: \$end_raw"
+  exit 1
+fi
+
+days_left=\$(((end_epoch - \$(date +%s)) / 86400))
+
+if ((days_left <= critical_days)); then
+  logger -t ikev2-manager -p daemon.crit "certificate expires in \${days_left}d; ACME renewal is not working"
+  exit 1
+elif ((days_left <= warn_days)); then
+  logger -t ikev2-manager -p daemon.warning "certificate expires in \${days_left}d"
+else
+  logger -t ikev2-manager -p daemon.info "certificate valid for \${days_left}d"
+fi
+EOF_CHECK
+  chmod 700 "$CERT_CHECK_SCRIPT"
+
+  cat >"$CERT_CHECK_SERVICE" <<EOF_CHECK_SVC
+[Unit]
+Description=IKEv2 Manager certificate expiry check
+
+[Service]
+Type=oneshot
+ExecStart=${CERT_CHECK_SCRIPT}
+EOF_CHECK_SVC
+
+  cat >"$CERT_CHECK_TIMER" <<'EOF_CHECK_TIMER'
+[Unit]
+Description=Daily IKEv2 Manager certificate expiry check
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF_CHECK_TIMER
+
+  systemctl daemon-reload
+  systemctl enable --now ikev2-manager-certcheck.timer >/dev/null 2>&1 || true
+}
+
+# Records which of the required packages were actually missing, so that
+# uninstall can purge exactly what this script added and nothing else.
 ensure_packages() {
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y \
-    ca-certificates \
-    curl \
-    openssl \
-    iproute2 \
-    kmod \
-    iptables \
-    iptables-persistent \
-    strongswan-swanctl \
-    charon-systemd \
-    strongswan-pki \
+  local required=(
+    ca-certificates
+    curl
+    openssl
+    iproute2
+    kmod
+    iptables
+    strongswan-swanctl
+    charon-systemd
     libcharon-extra-plugins
+  )
+  local package added=()
+
+  export DEBIAN_FRONTEND=noninteractive
+  for package in "${required[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "^install ok installed$"; then
+      added+=("$package")
+    fi
+  done
+
+  apt-get update
+  apt-get install -y "${required[@]}" || return 1
+
+  local IFS=','
+  MANAGED_PACKAGES="${added[*]+"${added[*]}"}"
 }
 
 ensure_acme_installed() {
@@ -947,141 +1297,327 @@ ensure_acme_installed() {
 
   local installer rc=0
   installer=$(mktemp) || return 1
-  if curl -fsSL https://get.acme.sh -o "$installer"; then
+
+  # Preferred path: the acme.sh script from a pinned upstream tag, installed
+  # with its own --install mode. No confirmation is needed because the URL
+  # points at an immutable tag.
+  if curl -fsSL "$ACME_INSTALLER_URL" -o "$installer" && [[ -s "$installer" ]]; then
+    echo "Installing acme.sh ${ACME_VERSION} (pinned)."
     if [[ -n "${ACME_EMAIL:-}" ]]; then
-      sh "$installer" email="$ACME_EMAIL" || rc=1
+      sh "$installer" --install --home "$ACME_HOME" --accountemail "$ACME_EMAIL" >/dev/null || rc=1
     else
-      sh "$installer" || rc=1
+      sh "$installer" --install --home "$ACME_HOME" >/dev/null || rc=1
     fi
   else
     rc=1
   fi
+
+  # Fallback: the moving installer. It is unpinned, so the operator has to
+  # approve the exact bytes.
+  if ((rc != 0)) || [[ ! -x "$ACME_BIN" ]]; then
+    rc=0
+    echo "Pinned acme.sh ${ACME_VERSION} is unavailable; falling back to ${ACME_INSTALLER_FALLBACK_URL}."
+    if fetch_and_confirm_script "$ACME_INSTALLER_FALLBACK_URL" "$installer"; then
+      if [[ -n "${ACME_EMAIL:-}" ]]; then
+        sh "$installer" email="$ACME_EMAIL" || rc=1
+      else
+        sh "$installer" || rc=1
+      fi
+    else
+      rc=1
+    fi
+  fi
+
   rm -f "$installer"
   ((rc == 0)) && [[ -x "$ACME_BIN" ]]
 }
 
+# Ports sshd actually listens on, resolved while the manager is running and
+# baked into the generated script: resolving them at boot races sshd startup
+# and a wrong answer locks the operator out.
+detect_ssh_ports() {
+  local ports
+  ports="$({
+    awk '$1 == "Port" { print $2 }' \
+      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null
+    ss -Hlntp 2>/dev/null | awk '/"sshd"/ { sub(/.*:/, "", $4); print $4 }'
+  } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+  ports="$(trim "${ports:-}")"
+  printf '%s' "${ports:-22}"
+}
+
 write_firewall_script() {
   ensure_manager_dir
-  cat >"$FIREWALL_SCRIPT" <<EOF_FW
+  cat >"$FIREWALL_SCRIPT" <<EOF_FW_HEAD
 #!/usr/bin/env bash
+# ${GENERATED_TAG}: v${SCRIPT_VERSION}
+# Generated file. Edit the manager configuration and reapply instead.
 set -Eeuo pipefail
+
 POOL_CIDR='${VPN_POOL_CIDR}'
 POOL6_CIDR='${VPN_POOL6_CIDR}'
 UPLINK_IF='${UPLINK_IF}'
+IPV6_MODE='${IPV6_MODE:-off}'
 CLIENT_ISOLATION='${CLIENT_ISOLATION:-1}'
+EGRESS_POLICY='${EGRESS_POLICY:-internet-only}'
+EGRESS_BLOCKED_V4='${EGRESS_BLOCKED_V4}'
+EGRESS_BLOCKED_V6='${EGRESS_BLOCKED_V6}'
+EGRESS_HOST_TCP_PORTS='${EGRESS_HOST_TCP_PORTS}'
+EGRESS_HOST_UDP_PORTS='${EGRESS_HOST_UDP_PORTS}'
+VPN_DNS='${VPN_DNS}'
+ACME_MODE='${ACME_MODE:-dns-01}'
 HARDEN_INPUT='${HARDEN_INPUT:-0}'
 HARDEN_TCP_PORTS='${HARDEN_TCP_PORTS}'
 HARDEN_UDP_PORTS='${HARDEN_UDP_PORTS}'
+HARDEN_SSH_PORTS='$(detect_ssh_ports)'
 HARDEN_CHAIN='IKEV2_MGR_IN'
+EGRESS_CHAIN='IKEV2_MGR_FWD'
+HOST_CHAIN='IKEV2_MGR_HOST'
+MT_CONFIG='${MT_CONFIG_FILE}'
+EOF_FW_HEAD
 
-# IKEv2 server ports. External NAT/security-group rules still have to allow UDP/500 and UDP/4500.
-iptables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1 || \
-  iptables -I INPUT -p udp --dport 500 -j ACCEPT
-iptables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1 || \
-  iptables -I INPUT -p udp --dport 4500 -j ACCEPT
+  cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_BODY'
 
+# --------------------------------------------------------------------------
+# Rule helpers. Every rule is applied with check-then-act so the script is
+# idempotent and safe to run on every boot and on every configuration change.
+# --------------------------------------------------------------------------
+ipt_ins() {
+  local tool="$1" table="$2" chain="$3"
+  shift 3
+  "$tool" -t "$table" -C "$chain" "$@" >/dev/null 2>&1 \
+    || "$tool" -t "$table" -I "$chain" "$@"
+}
+
+ipt_app() {
+  local tool="$1" table="$2" chain="$3"
+  shift 3
+  "$tool" -t "$table" -C "$chain" "$@" >/dev/null 2>&1 \
+    || "$tool" -t "$table" -A "$chain" "$@"
+}
+
+ipt_del() {
+  local tool="$1" table="$2" chain="$3"
+  shift 3
+  while "$tool" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
+    "$tool" -t "$table" -D "$chain" "$@" || break
+  done
+}
+
+ipt_chain_reset() {
+  local tool="$1" chain="$2"
+  "$tool" -N "$chain" 2>/dev/null || true
+  "$tool" -F "$chain"
+}
+
+ipt_chain_drop() {
+  local tool="$1" parent="$2" chain="$3"
+  shift 3
+  ipt_del "$tool" filter "$parent" "$@" -j "$chain"
+  "$tool" -F "$chain" 2>/dev/null || true
+  "$tool" -X "$chain" 2>/dev/null || true
+}
+
+# Client DNS servers of the matching family; they stay reachable even when
+# they live on a network the egress policy otherwise blocks.
+dns_servers_v4() {
+  local entry
+  local IFS=','
+  for entry in $VPN_DNS; do
+    [[ "$entry" == *:* ]] && continue
+    [[ -n "$entry" ]] && printf '%s\n' "$entry"
+  done
+}
+
+dns_servers_v6() {
+  local entry
+  local IFS=','
+  for entry in $VPN_DNS; do
+    [[ "$entry" == *:* ]] || continue
+    printf '%s\n' "$entry"
+  done
+}
+
+have_ip6tables=0
+command -v ip6tables >/dev/null 2>&1 && have_ip6tables=1
+
+# Listening port of the MTProto proxy, when it is installed.
+mt_port=""
+if [[ -f "$MT_CONFIG" ]]; then
+  mt_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} \
+    f && /^[[:space:]]*port[[:space:]]*=/{sub(/.*=[[:space:]]*/,""); gsub(/[^0-9]/,"",$0); print; exit}' \
+    "$MT_CONFIG" 2>/dev/null || true)"
+fi
+
+# --------------------------------------------------------------------------
+# IKEv2 listeners. External NAT/security-group rules still have to allow
+# UDP/500 and UDP/4500.
+# --------------------------------------------------------------------------
+ipt_ins iptables filter INPUT -p udp --dport 500 -j ACCEPT
+ipt_ins iptables filter INPUT -p udp --dport 4500 -j ACCEPT
+
+# The proxy port is reopened here as well so the rule survives a reboot on
+# hosts with a restrictive INPUT policy; nothing else reapplies it.
+if [[ -n "$mt_port" ]]; then
+  ipt_ins iptables filter INPUT -p tcp --dport "$mt_port" -m comment --comment "mtproto-manager" -j ACCEPT
+fi
+
+# --------------------------------------------------------------------------
 # Full-tunnel forwarding/NAT for VPN clients.
-iptables -t nat -C POSTROUTING -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1 || \
-  iptables -t nat -I POSTROUTING -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j MASQUERADE
-iptables -C FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
-  iptables -I FORWARD -s "\$POOL_CIDR" -o "\$UPLINK_IF" -j ACCEPT
-iptables -C FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
-  iptables -I FORWARD -d "\$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "\$UPLINK_IF" -j ACCEPT
+# --------------------------------------------------------------------------
+ipt_ins iptables nat POSTROUTING -s "$POOL_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+ipt_ins iptables filter FORWARD -s "$POOL_CIDR" -o "$UPLINK_IF" -j ACCEPT
+ipt_ins iptables filter FORWARD -d "$POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
 
 # Clamp TCP MSS to path MTU for tunneled clients: native IKEv2 clients have
 # no MSS help from their side, large packets blackhole without this.
-iptables -t mangle -C FORWARD -s "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
-  iptables -t mangle -A FORWARD -s "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-iptables -t mangle -C FORWARD -d "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
-  iptables -t mangle -A FORWARD -d "\$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+ipt_app iptables mangle FORWARD -s "$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+ipt_app iptables mangle FORWARD -d "$POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# Hairpinned client-to-client traffic; inserted last so it lands above the
-# pool ACCEPT rules.
-if [[ "\$CLIENT_ISOLATION" == "1" ]]; then
-  iptables -C FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP >/dev/null 2>&1 || \
-    iptables -I FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP
+# Hairpinned client-to-client traffic; inserted before the egress chain so
+# the egress chain jump ends up above it.
+if [[ "$CLIENT_ISOLATION" == "1" ]]; then
+  ipt_ins iptables filter FORWARD -s "$POOL_CIDR" -d "$POOL_CIDR" -j DROP
 else
-  while iptables -C FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP >/dev/null 2>&1; do
-    iptables -D FORWARD -s "\$POOL_CIDR" -d "\$POOL_CIDR" -j DROP || break
+  ipt_del iptables filter FORWARD -s "$POOL_CIDR" -d "$POOL_CIDR" -j DROP
+fi
+
+# --------------------------------------------------------------------------
+# Egress policy. Under internet-only a VPN client must not be able to use the
+# tunnel as a foothold into the hosting network: cloud metadata (169.254/16),
+# private ranges and this host's own services are dropped. Configured client
+# DNS servers are exempted, and the pool itself returns so that the client
+# isolation rule above stays authoritative.
+# --------------------------------------------------------------------------
+if [[ "$EGRESS_POLICY" == "internet-only" ]]; then
+  ipt_chain_reset iptables "$EGRESS_CHAIN"
+  while IFS= read -r dns_server; do
+    [[ -n "$dns_server" ]] || continue
+    iptables -A "$EGRESS_CHAIN" -d "$dns_server" -j RETURN
+  done < <(dns_servers_v4)
+  iptables -A "$EGRESS_CHAIN" -d "$POOL_CIDR" -j RETURN
+  for blocked in $EGRESS_BLOCKED_V4; do
+    iptables -A "$EGRESS_CHAIN" -d "$blocked" -j DROP
   done
+  ipt_ins iptables filter FORWARD -s "$POOL_CIDR" -j "$EGRESS_CHAIN"
+
+  # Traffic addressed to the host itself lands in INPUT, not FORWARD.
+  ipt_chain_reset iptables "$HOST_CHAIN"
+  iptables -A "$HOST_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A "$HOST_CHAIN" -p icmp -j ACCEPT
+  iptables -A "$HOST_CHAIN" -p udp --dport 53 -j ACCEPT
+  iptables -A "$HOST_CHAIN" -p tcp --dport 53 -j ACCEPT
+  for port in ${EGRESS_HOST_TCP_PORTS//,/ }; do
+    iptables -A "$HOST_CHAIN" -p tcp --dport "$port" -j ACCEPT
+  done
+  for port in ${EGRESS_HOST_UDP_PORTS//,/ }; do
+    iptables -A "$HOST_CHAIN" -p udp --dport "$port" -j ACCEPT
+  done
+  iptables -A "$HOST_CHAIN" -j DROP
+  ipt_ins iptables filter INPUT -s "$POOL_CIDR" -j "$HOST_CHAIN"
+else
+  ipt_chain_drop iptables FORWARD "$EGRESS_CHAIN" -s "$POOL_CIDR"
+  ipt_chain_drop iptables INPUT "$HOST_CHAIN" -s "$POOL_CIDR"
 fi
-EOF_FW
 
-  if [[ "${IPV6_MODE:-off}" != "off" ]]; then
-    cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_IN'
-
-if command -v ip6tables >/dev/null 2>&1; then
-  # Accept IKE over IPv6 transport.
-  ip6tables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1 || \
-    ip6tables -I INPUT -p udp --dport 500 -j ACCEPT
-  ip6tables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1 || \
-    ip6tables -I INPUT -p udp --dport 4500 -j ACCEPT
-EOF_FW6_IN
-    if [[ "$IPV6_MODE" == "nat" ]]; then
-      cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_NAT'
-
-  # Full IPv6 for clients through NAT66.
-  ip6tables -t nat -C POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1 || \
-    ip6tables -t nat -I POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE
-  ip6tables -C FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
-    ip6tables -I FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
-  ip6tables -C FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1 || \
-    ip6tables -I FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
-
-  ip6tables -t mangle -C FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
-    ip6tables -t mangle -A FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-  ip6tables -t mangle -C FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || \
-    ip6tables -t mangle -A FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-  if [[ "$CLIENT_ISOLATION" == "1" ]]; then
-    ip6tables -C FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP >/dev/null 2>&1 || \
-      ip6tables -I FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP
+# --------------------------------------------------------------------------
+# IPv6. The rules of the modes that are not active are removed, so switching
+# block <-> nat <-> off converges instead of stacking up.
+# --------------------------------------------------------------------------
+if ((have_ip6tables)); then
+  if [[ "$IPV6_MODE" == "off" ]]; then
+    ipt_del ip6tables filter INPUT -p udp --dport 500 -j ACCEPT
+    ipt_del ip6tables filter INPUT -p udp --dport 4500 -j ACCEPT
   else
-    while ip6tables -C FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP >/dev/null 2>&1; do
-      ip6tables -D FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP || break
-    done
+    ipt_ins ip6tables filter INPUT -p udp --dport 500 -j ACCEPT
+    ipt_ins ip6tables filter INPUT -p udp --dport 4500 -j ACCEPT
   fi
-fi
-EOF_FW6_NAT
-    else
-      cat >>"$FIREWALL_SCRIPT" <<'EOF_FW6_BLOCK'
 
-  # Blackhole client IPv6 so dual-stack clients cannot leak around the tunnel.
-  ip6tables -C FORWARD -s "$POOL6_CIDR" -j DROP >/dev/null 2>&1 || \
-    ip6tables -A FORWARD -s "$POOL6_CIDR" -j DROP
-fi
-EOF_FW6_BLOCK
+  if [[ "$IPV6_MODE" == "nat" ]]; then
+    ipt_del ip6tables filter FORWARD -s "$POOL6_CIDR" -j DROP
+
+    ipt_ins ip6tables nat POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+    ipt_ins ip6tables filter FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
+    ipt_ins ip6tables filter FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
+    ipt_app ip6tables mangle FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_app ip6tables mangle FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+    if [[ "$CLIENT_ISOLATION" == "1" ]]; then
+      ipt_ins ip6tables filter FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP
+    else
+      ipt_del ip6tables filter FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP
+    fi
+
+    if [[ "$EGRESS_POLICY" == "internet-only" ]]; then
+      ipt_chain_reset ip6tables "$EGRESS_CHAIN"
+      while IFS= read -r dns_server; do
+        [[ -n "$dns_server" ]] || continue
+        ip6tables -A "$EGRESS_CHAIN" -d "$dns_server" -j RETURN
+      done < <(dns_servers_v6)
+      ip6tables -A "$EGRESS_CHAIN" -d "$POOL6_CIDR" -j RETURN
+      for blocked in $EGRESS_BLOCKED_V6; do
+        ip6tables -A "$EGRESS_CHAIN" -d "$blocked" -j DROP
+      done
+      ipt_ins ip6tables filter FORWARD -s "$POOL6_CIDR" -j "$EGRESS_CHAIN"
+
+      ipt_chain_reset ip6tables "$HOST_CHAIN"
+      ip6tables -A "$HOST_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      ip6tables -A "$HOST_CHAIN" -p ipv6-icmp -j ACCEPT
+      ip6tables -A "$HOST_CHAIN" -p udp --dport 53 -j ACCEPT
+      ip6tables -A "$HOST_CHAIN" -p tcp --dport 53 -j ACCEPT
+      for port in ${EGRESS_HOST_TCP_PORTS//,/ }; do
+        ip6tables -A "$HOST_CHAIN" -p tcp --dport "$port" -j ACCEPT
+      done
+      for port in ${EGRESS_HOST_UDP_PORTS//,/ }; do
+        ip6tables -A "$HOST_CHAIN" -p udp --dport "$port" -j ACCEPT
+      done
+      ip6tables -A "$HOST_CHAIN" -j DROP
+      ipt_ins ip6tables filter INPUT -s "$POOL6_CIDR" -j "$HOST_CHAIN"
+    else
+      ipt_chain_drop ip6tables FORWARD "$EGRESS_CHAIN" -s "$POOL6_CIDR"
+      ipt_chain_drop ip6tables INPUT "$HOST_CHAIN" -s "$POOL6_CIDR"
+    fi
+  else
+    # Not NAT66: drop the forwarding/NAT rules of that mode.
+    ipt_del ip6tables nat POSTROUTING -s "$POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+    ipt_del ip6tables filter FORWARD -s "$POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
+    ipt_del ip6tables filter FORWARD -d "$POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
+    ipt_del ip6tables mangle FORWARD -s "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_del ip6tables mangle FORWARD -d "$POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_del ip6tables filter FORWARD -s "$POOL6_CIDR" -d "$POOL6_CIDR" -j DROP
+    ipt_chain_drop ip6tables FORWARD "$EGRESS_CHAIN" -s "$POOL6_CIDR"
+    ipt_chain_drop ip6tables INPUT "$HOST_CHAIN" -s "$POOL6_CIDR"
+
+    if [[ "$IPV6_MODE" == "block" ]]; then
+      # Blackhole client IPv6 so dual-stack clients cannot leak around the
+      # tunnel.
+      ipt_app ip6tables filter FORWARD -s "$POOL6_CIDR" -j DROP
+    else
+      ipt_del ip6tables filter FORWARD -s "$POOL6_CIDR" -j DROP
     fi
   fi
-
-  cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_HARDEN'
-
-# Inbound hardening: a default-drop allowlist chain appended to INPUT.
-# SSH ports are detected at run time so a changed sshd_config cannot cause
-# a lockout; IKEv2, ESP, ICMP and explicitly listed ports stay reachable.
-harden_tools=(iptables)
-if command -v ip6tables >/dev/null 2>&1; then
-  harden_tools+=(ip6tables)
 fi
+
+# --------------------------------------------------------------------------
+# Inbound hardening: a default-drop allowlist chain appended to INPUT.
+# SSH ports are resolved when the rules are generated (not at boot, where
+# sshd may not have started yet), IKEv2, ESP, ICMP, DHCP, the ACME HTTP-01
+# port and explicitly listed ports stay reachable.
+# --------------------------------------------------------------------------
+harden_tools=(iptables)
+((have_ip6tables)) && harden_tools+=(ip6tables)
 
 if [[ "$HARDEN_INPUT" == "1" ]]; then
   ssh_ports="$({
+    printf '%s\n' $HARDEN_SSH_PORTS
     awk '$1 == "Port" { print $2 }' \
       /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null
     ss -Hlntp 2>/dev/null | awk '/"sshd"/ { sub(/.*:/, "", $4); print $4 }'
   } | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
   [[ -n "${ssh_ports// /}" ]] || ssh_ports="22"
 
-  mt_port=""
-  if [[ -f /opt/mtproto-proxy/config.toml ]]; then
-    mt_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} \
-      f && /port[[:space:]]*=/{gsub(/[^0-9]/,"",$0); print; exit}' \
-      /opt/mtproto-proxy/config.toml 2>/dev/null || true)"
-  fi
-
   for ipt in "${harden_tools[@]}"; do
-    "$ipt" -N "$HARDEN_CHAIN" 2>/dev/null || true
-    "$ipt" -F "$HARDEN_CHAIN"
+    ipt_chain_reset "$ipt" "$HARDEN_CHAIN"
     "$ipt" -A "$HARDEN_CHAIN" -i lo -j ACCEPT
     "$ipt" -A "$HARDEN_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     if [[ "$ipt" == "ip6tables" ]]; then
@@ -1090,6 +1626,9 @@ if [[ "$HARDEN_INPUT" == "1" ]]; then
       "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 546 -j ACCEPT
     else
       "$ipt" -A "$HARDEN_CHAIN" -p icmp -j ACCEPT
+      # DHCPv4 lease renewal on cloud instances that do not use static
+      # addressing; the reply can arrive outside an existing conntrack entry.
+      "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 68 -j ACCEPT
     fi
     "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 500 -j ACCEPT
     "$ipt" -A "$HARDEN_CHAIN" -p udp --dport 4500 -j ACCEPT
@@ -1098,6 +1637,10 @@ if [[ "$HARDEN_INPUT" == "1" ]]; then
     for port in $ssh_ports; do
       "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport "$port" -j ACCEPT
     done
+    # HTTP-01 renewal runs unattended from cron and needs inbound TCP/80.
+    if [[ "$ACME_MODE" == "http-01" ]]; then
+      "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport 80 -j ACCEPT
+    fi
     if [[ -n "$mt_port" ]]; then
       "$ipt" -A "$HARDEN_CHAIN" -p tcp --dport "$mt_port" -j ACCEPT
     fi
@@ -1108,31 +1651,19 @@ if [[ "$HARDEN_INPUT" == "1" ]]; then
       "$ipt" -A "$HARDEN_CHAIN" -p udp --dport "$port" -j ACCEPT
     done
     "$ipt" -A "$HARDEN_CHAIN" -j DROP
-    "$ipt" -C INPUT -j "$HARDEN_CHAIN" >/dev/null 2>&1 || \
-      "$ipt" -A INPUT -j "$HARDEN_CHAIN"
+    ipt_app "$ipt" filter INPUT -j "$HARDEN_CHAIN"
   done
 else
   for ipt in "${harden_tools[@]}"; do
-    while "$ipt" -C INPUT -j "$HARDEN_CHAIN" >/dev/null 2>&1; do
-      "$ipt" -D INPUT -j "$HARDEN_CHAIN" || break
-    done
-    "$ipt" -F "$HARDEN_CHAIN" 2>/dev/null || true
-    "$ipt" -X "$HARDEN_CHAIN" 2>/dev/null || true
+    ipt_chain_drop "$ipt" INPUT "$HARDEN_CHAIN"
   done
 fi
-EOF_FW_HARDEN
 
-  cat >>"$FIREWALL_SCRIPT" <<'EOF_FW_SAVE'
-
-if command -v iptables-save >/dev/null 2>&1; then
-  mkdir -p /etc/iptables
-  iptables-save > /etc/iptables/rules.v4 || true
-fi
-if command -v ip6tables-save >/dev/null 2>&1; then
-  mkdir -p /etc/iptables
-  ip6tables-save > /etc/iptables/rules.v6 || true
-fi
-EOF_FW_SAVE
+# These rules are reapplied by ikev2-manager-firewall.service on every boot.
+# Nothing is written to /etc/iptables here on purpose: dumping the live
+# ruleset would also persist unrelated rules owned by Docker, ufw or the
+# hosting provider.
+EOF_FW_BODY
   chmod 700 "$FIREWALL_SCRIPT"
 }
 
@@ -1140,7 +1671,8 @@ write_firewall_service() {
   cat >"$FIREWALL_SERVICE" <<EOF_SVC
 [Unit]
 Description=IKEv2 Manager firewall rules
-After=network-online.target
+Documentation=file://${FIREWALL_SCRIPT}
+After=network-online.target netfilter-persistent.service
 Wants=network-online.target
 
 [Service]
@@ -1166,78 +1698,41 @@ apply_firewall_rules() {
 }
 
 remove_firewall_rules() {
-  while iptables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1; do
-    iptables -D INPUT -p udp --dport 500 -j ACCEPT || break
-  done
-  while iptables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1; do
-    iptables -D INPUT -p udp --dport 4500 -j ACCEPT || break
-  done
+  local chain
+  ipt_del_rule iptables filter INPUT -p udp --dport 500 -j ACCEPT
+  ipt_del_rule iptables filter INPUT -p udp --dport 4500 -j ACCEPT
 
   if [[ -n "${UPLINK_IF:-}" ]]; then
-    while iptables -t nat -C POSTROUTING -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1; do
-      iptables -t nat -D POSTROUTING -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j MASQUERADE || break
-    done
-    while iptables -C FORWARD -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
-      iptables -D FORWARD -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j ACCEPT || break
-    done
-    while iptables -C FORWARD -d "$VPN_POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
-      iptables -D FORWARD -d "$VPN_POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT || break
-    done
+    ipt_del_rule iptables nat POSTROUTING -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+    ipt_del_rule iptables filter FORWARD -s "$VPN_POOL_CIDR" -o "$UPLINK_IF" -j ACCEPT
+    ipt_del_rule iptables filter FORWARD -d "$VPN_POOL_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
   fi
 
-  while iptables -t mangle -C FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
-    iptables -t mangle -D FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
-  done
-  while iptables -t mangle -C FORWARD -d "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
-    iptables -t mangle -D FORWARD -d "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
-  done
-  while iptables -C FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP >/dev/null 2>&1; do
-    iptables -D FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP || break
-  done
-  while iptables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1; do
-    iptables -D INPUT -j IKEV2_MGR_IN || break
-  done
-  iptables -F IKEV2_MGR_IN 2>/dev/null || true
-  iptables -X IKEV2_MGR_IN 2>/dev/null || true
+  ipt_del_rule iptables mangle FORWARD -s "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  ipt_del_rule iptables mangle FORWARD -d "$VPN_POOL_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  ipt_del_rule iptables filter FORWARD -s "$VPN_POOL_CIDR" -d "$VPN_POOL_CIDR" -j DROP
+  ipt_drop_chain iptables FORWARD "$EGRESS_CHAIN" -s "$VPN_POOL_CIDR"
+  ipt_drop_chain iptables INPUT "$HOST_CHAIN" -s "$VPN_POOL_CIDR"
+  ipt_drop_chain iptables INPUT "$HARDEN_CHAIN"
 
   if command -v ip6tables >/dev/null 2>&1; then
-    while ip6tables -C INPUT -p udp --dport 500 -j ACCEPT >/dev/null 2>&1; do
-      ip6tables -D INPUT -p udp --dport 500 -j ACCEPT || break
-    done
-    while ip6tables -C INPUT -p udp --dport 4500 -j ACCEPT >/dev/null 2>&1; do
-      ip6tables -D INPUT -p udp --dport 4500 -j ACCEPT || break
-    done
+    ipt_del_rule ip6tables filter INPUT -p udp --dport 500 -j ACCEPT
+    ipt_del_rule ip6tables filter INPUT -p udp --dport 4500 -j ACCEPT
 
     if [[ -n "${VPN_POOL6_CIDR:-}" ]]; then
-      while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -j DROP >/dev/null 2>&1; do
-        ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -j DROP || break
-      done
+      ipt_del_rule ip6tables filter FORWARD -s "$VPN_POOL6_CIDR" -j DROP
       if [[ -n "${UPLINK_IF:-}" ]]; then
-        while ip6tables -t nat -C POSTROUTING -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE >/dev/null 2>&1; do
-          ip6tables -t nat -D POSTROUTING -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE || break
-        done
-        while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
-          ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT || break
-        done
-        while ip6tables -C FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT >/dev/null 2>&1; do
-          ip6tables -D FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT || break
-        done
+        ipt_del_rule ip6tables nat POSTROUTING -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j MASQUERADE
+        ipt_del_rule ip6tables filter FORWARD -s "$VPN_POOL6_CIDR" -o "$UPLINK_IF" -j ACCEPT
+        ipt_del_rule ip6tables filter FORWARD -d "$VPN_POOL6_CIDR" -m conntrack --ctstate ESTABLISHED,RELATED -i "$UPLINK_IF" -j ACCEPT
       fi
-      while ip6tables -t mangle -C FORWARD -s "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
-        ip6tables -t mangle -D FORWARD -s "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
-      done
-      while ip6tables -t mangle -C FORWARD -d "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; do
-        ip6tables -t mangle -D FORWARD -d "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || break
-      done
-      while ip6tables -C FORWARD -s "$VPN_POOL6_CIDR" -d "$VPN_POOL6_CIDR" -j DROP >/dev/null 2>&1; do
-        ip6tables -D FORWARD -s "$VPN_POOL6_CIDR" -d "$VPN_POOL6_CIDR" -j DROP || break
-      done
+      ipt_del_rule ip6tables mangle FORWARD -s "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      ipt_del_rule ip6tables mangle FORWARD -d "$VPN_POOL6_CIDR" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      ipt_del_rule ip6tables filter FORWARD -s "$VPN_POOL6_CIDR" -d "$VPN_POOL6_CIDR" -j DROP
+      ipt_drop_chain ip6tables FORWARD "$EGRESS_CHAIN" -s "$VPN_POOL6_CIDR"
+      ipt_drop_chain ip6tables INPUT "$HOST_CHAIN" -s "$VPN_POOL6_CIDR"
     fi
-    while ip6tables -C INPUT -j IKEV2_MGR_IN >/dev/null 2>&1; do
-      ip6tables -D INPUT -j IKEV2_MGR_IN || break
-    done
-    ip6tables -F IKEV2_MGR_IN 2>/dev/null || true
-    ip6tables -X IKEV2_MGR_IN 2>/dev/null || true
+    ipt_drop_chain ip6tables INPUT "$HARDEN_CHAIN"
   fi
 
   if [[ -f "$FIREWALL_SERVICE" ]]; then
@@ -1248,20 +1743,46 @@ remove_firewall_rules() {
 
   rm -f "$FIREWALL_SCRIPT"
 
-  if command -v iptables-save >/dev/null 2>&1; then
-    mkdir -p /etc/iptables
-    iptables-save >/etc/iptables/rules.v4 || true
+  # Persisted rule files are deliberately left alone: this script never wrote
+  # them, and rewriting them here would capture unrelated rules.
+  for chain in "$EGRESS_CHAIN" "$HOST_CHAIN" "$HARDEN_CHAIN"; do
+    iptables -X "$chain" 2>/dev/null || true
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -X "$chain" 2>/dev/null || true
+  done
+}
+
+# Other software on the host may depend on forwarding (Docker, k8s, another
+# VPN). Turning it off unconditionally used to break their networking, so it
+# is only reset when nothing else asks for it.
+forwarding_used_by_others() {
+  if systemctl is-active --quiet docker.service 2>/dev/null; then
+    printf 'docker.service'
+    return 0
   fi
-  if command -v ip6tables-save >/dev/null 2>&1; then
-    mkdir -p /etc/iptables
-    ip6tables-save >/etc/iptables/rules.v6 || true
+  if [[ -d /sys/class/net/docker0 ]]; then
+    printf 'docker0 bridge'
+    return 0
   fi
+  local hit
+  hit="$(grep -rls '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1' \
+    /etc/sysctl.conf /etc/sysctl.d /usr/lib/sysctl.d 2>/dev/null \
+    | grep -v "^${SYSCTL_FILE}$" | head -n1 || true)"
+  if [[ -n "$hit" ]]; then
+    printf '%s' "$hit"
+    return 0
+  fi
+  return 1
 }
 
 disable_sysctl() {
-  rm -f "$SYSCTL_FILE"
-  sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
-  sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+  local owner
+  rm -f "$SYSCTL_FILE" "$MODULES_LOAD_FILE"
+  if owner="$(forwarding_used_by_others)"; then
+    echo "IP forwarding left enabled: still required by ${owner}."
+  else
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.forwarding=0 >/dev/null 2>&1 || true
+  fi
   sysctl --system >/dev/null 2>&1 || true
 }
 
@@ -1276,25 +1797,54 @@ cleanup_acme_binding() {
 
 cleanup_managed_files() {
   rm -f "$SWANCTL_CONF" "$CERT_PATH" "$CA_PATH" "$KEY_PATH"
-  rm -f "$LEGACY_CA_PATH" "$CA_ROOT_PATH" "$CERT_RELOAD_SCRIPT"
+  rm -f "$LEGACY_CA_PATH" "$CA_ROOT_PATH" "$CERT_RELOAD_SCRIPT" "$CERT_CHECK_SCRIPT"
   rm -f "${CA_CHAIN_PREFIX}"-*.pem /etc/swanctl/x509ca/ikev2-chain-*.pem
   rm -f "${CERT_PATH}".bak.* "${CA_PATH}".bak.* "${KEY_PATH}".bak.* "${SWANCTL_CONF}".bak.* 2>/dev/null || true
-  rm -f /etc/swanctl/conf.d/*.conf 2>/dev/null || true
-  rmdir /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private /etc/swanctl/conf.d /etc/swanctl 2>/dev/null || true
+  # /etc/swanctl/conf.d may hold configuration this manager never wrote; it
+  # is left alone.
+  rmdir /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private /etc/swanctl 2>/dev/null || true
+
+  if [[ -f "$CERT_CHECK_TIMER" || -f "$CERT_CHECK_SERVICE" ]]; then
+    systemctl disable --now ikev2-manager-certcheck.timer >/dev/null 2>&1 || true
+    rm -f "$CERT_CHECK_TIMER" "$CERT_CHECK_SERVICE"
+    systemctl daemon-reload
+  fi
 }
 
+# Only packages this manager installed are purged, and only the strongSwan
+# ones: removing shared libraries or running autoremove could take unrelated
+# software with them.
 purge_vpn_packages() {
+  local -a candidates=() purge=()
+  local package ans
+  local IFS=','
+  for package in ${MANAGED_PACKAGES:-}; do
+    [[ -n "$package" ]] && candidates+=("$package")
+  done
+  unset IFS
+
+  for package in "${candidates[@]+"${candidates[@]}"}"; do
+    case "$package" in
+      strongswan-swanctl | charon-systemd | libcharon-extra-plugins | strongswan-pki)
+        purge+=("$package")
+        ;;
+    esac
+  done
+
+  if ((${#purge[@]} == 0)); then
+    echo "No strongSwan packages recorded as installed by this manager; leaving packages in place."
+    return 0
+  fi
+
+  echo "Packages installed by this manager: ${purge[*]}"
+  read -r -p "Purge them? [y/N]: " ans || true
+  [[ "$ans" =~ ^[Yy]$ ]] || {
+    echo "Packages left installed."
+    return 0
+  }
+
   export DEBIAN_FRONTEND=noninteractive
-  apt-get purge -y \
-    strongswan-swanctl \
-    charon-systemd \
-    strongswan-pki \
-    libcharon-extra-plugins \
-    strongswan-libcharon \
-    libcharon-extauth-plugins \
-    libstrongswan-standard-plugins \
-    libstrongswan >/dev/null 2>&1 || true
-  apt-get autoremove -y >/dev/null 2>&1 || true
+  apt-get purge -y "${purge[@]}" >/dev/null 2>&1 || true
 }
 
 uninstall_cleanup() {
@@ -1306,8 +1856,8 @@ uninstall_cleanup() {
   echo "- remove managed firewall rules and firewall unit"
   echo "- remove manager config, users, generated VPN config and installed cert paths"
   echo "- remove ACME renewal binding for the configured domain"
-  echo "- purge strongSwan packages installed by this manager"
-  echo "- reset IPv4 forwarding managed by this script"
+  echo "- offer to purge the strongSwan packages this manager installed"
+  echo "- reset IPv4 forwarding, unless another service still needs it"
   echo
   read -r -p "Type DELETE to continue: " confirm || true
   [[ "$confirm" == "DELETE" ]] || return 0
@@ -1336,6 +1886,12 @@ uninstall_cleanup() {
   IPV6_MODE="$DEFAULT_IPV6_MODE"
   VPN_POOL6_CIDR="$DEFAULT_POOL6_CIDR"
   VPN_DNS="$DEFAULT_DNS_FALLBACK"
+  EGRESS_POLICY="$DEFAULT_EGRESS_POLICY"
+  EGRESS_HOST_TCP_PORTS="$DEFAULT_EGRESS_HOST_TCP_PORTS"
+  EGRESS_HOST_UDP_PORTS="$DEFAULT_EGRESS_HOST_UDP_PORTS"
+  CERT_KEY_TYPE="$DEFAULT_CERT_KEY_TYPE"
+  IKE_UNIQUE="$DEFAULT_IKE_UNIQUE"
+  MANAGED_PACKAGES=""
   UPLINK_IF="$(detect_uplink_if || true)"
   LAST_ERROR=""
   echo
@@ -1387,26 +1943,94 @@ ensure_kernel_ipsec_support() {
 }
 
 enable_sysctl() {
-  local current_conntrack_max target_conntrack_max
+  local current_conntrack_max target_conntrack_max applied_conntrack_max
   modprobe nf_conntrack >/dev/null 2>&1 || {
     echo "Failed to load nf_conntrack kernel module."
     return 1
   }
+
+  # systemd-sysctl runs before nf_conntrack is autoloaded, so a
+  # net.netfilter.* key in sysctl.d is silently dropped on boot unless the
+  # module is loaded early. Without this the configured limit only survives
+  # until the next reboot.
+  mkdir -p "$(dirname "$MODULES_LOAD_FILE")"
+  {
+    echo "# ${GENERATED_TAG}: v${SCRIPT_VERSION}"
+    echo "nf_conntrack"
+  } >"$MODULES_LOAD_FILE"
+  chmod 644 "$MODULES_LOAD_FILE"
+
   current_conntrack_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
   target_conntrack_max="$(conntrack_target_max "$current_conntrack_max")"
 
   {
+    echo "# ${GENERATED_TAG}: v${SCRIPT_VERSION}"
     echo "net.ipv4.ip_forward=1"
     echo "net.netfilter.nf_conntrack_max=$target_conntrack_max"
     if [[ "${IPV6_MODE:-off}" == "nat" ]]; then
       echo "net.ipv6.conf.all.forwarding=1"
     fi
   } >"$SYSCTL_FILE"
+  chmod 644 "$SYSCTL_FILE"
+
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w "net.netfilter.nf_conntrack_max=$target_conntrack_max" >/dev/null 2>&1 || true
   if [[ "${IPV6_MODE:-off}" == "nat" ]]; then
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
   fi
   sysctl -p "$SYSCTL_FILE" >/dev/null
+
+  applied_conntrack_max="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || true)"
+  if [[ "$applied_conntrack_max" != "$target_conntrack_max" ]]; then
+    echo "Warning: nf_conntrack_max is ${applied_conntrack_max:-unknown}, expected ${target_conntrack_max}."
+  fi
+}
+
+# True when a generated file carries the marker of the running version.
+generated_is_current() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  grep -qF "${GENERATED_TAG}: v${SCRIPT_VERSION}" "$file"
+}
+
+# Lists the managed artifacts that are missing or were written by an older
+# version of this script.
+stale_artifacts() {
+  local file
+  for file in "$FIREWALL_SCRIPT" "$SYSCTL_FILE" "$MODULES_LOAD_FILE" \
+    "$CERT_RELOAD_SCRIPT" "$CERT_CHECK_SCRIPT"; do
+    generated_is_current "$file" || printf '%s\n' "$file"
+  done
+}
+
+# Upgrading the script used to leave every generated artifact behind at its
+# old content: the configuration said one thing and the machine did another.
+# Regenerating them is idempotent, so it runs whenever a drift is detected.
+reconcile_managed_state() {
+  local force="${1:-}" stale
+  effective_installed || return 0
+  stale="$(stale_artifacts)"
+  if [[ -z "$stale" && "$force" != "force" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$stale" ]]; then
+    echo "Managed files were generated by an older version; regenerating:"
+    print_indented "$stale"
+  else
+    echo "Regenerating managed files."
+  fi
+  echo
+
+  write_certificate_reload_script
+  write_certificate_check_service
+  enable_sysctl || echo "Warning: failed to reapply sysctl settings."
+  if [[ -n "${UPLINK_IF:-}" ]]; then
+    apply_firewall_rules || echo "Warning: failed to reapply firewall rules."
+  fi
+  migrate_config
+  echo "Regeneration complete."
+  pause
 }
 
 escape_swanctl() {
@@ -1424,7 +2048,13 @@ generate_swanctl_conf() {
 
   # In block/nat modes clients get an IPv6 address and a ::/0 selector, so
   # dual-stack devices route IPv6 into the tunnel instead of leaking it.
-  local effective_local_ts="$LOCAL_TS" pool_list="vpn_pool" pool6_block=""
+  local effective_local_ts="$LOCAL_TS" pool_list="vpn_pool" pool6_block="" childless_line=""
+  # Apple clients negotiate childless IKE_SAs; strongSwan supports it from
+  # 5.9.6 and rejects the keyword on older builds.
+  if strongswan_at_least 5 9 6; then
+    childless_line="
+    childless = allow"
+  fi
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
     if [[ ",$LOCAL_TS," != *",::/0,"* ]]; then
       effective_local_ts="${LOCAL_TS},::/0"
@@ -1443,7 +2073,7 @@ connections {
     version = 2
     send_cert = always
     proposals = ${IKE_PROPOSALS}
-    unique = never
+    unique = ${IKE_UNIQUE:-never}${childless_line}
     dpd_delay = ${DPD_DELAY}
     mobike = yes
     fragmentation = yes
@@ -1547,8 +2177,15 @@ issue_and_install_cert() {
     return 1
   }
 
+  local keylength
+  keylength="$(acme_keylength_for "${CERT_KEY_TYPE:-$DEFAULT_CERT_KEY_TYPE}")" || {
+    echo "Unsupported certificate key type: ${CERT_KEY_TYPE:-}"
+    return 1
+  }
+
   mkdir -p /etc/swanctl/x509 /etc/swanctl/x509ca /etc/swanctl/private
   write_certificate_reload_script
+  write_certificate_check_service
   backup_file "$CERT_PATH"
   backup_file "$CA_PATH"
   backup_file "$KEY_PATH"
@@ -1568,12 +2205,12 @@ issue_and_install_cert() {
       }
       # shellcheck disable=SC1090
       source "$ACME_ENV_FILE"
-      "$ACME_BIN" --issue -d "$DOMAIN" --dns "$DNS_PROVIDER" --keylength 2048 || rc=$?
+      "$ACME_BIN" --issue -d "$DOMAIN" --dns "$DNS_PROVIDER" --keylength "$keylength" || rc=$?
       ;;
     http-01)
       echo "Using HTTP-01 standalone mode."
       echo "The host must be reachable from the Internet on TCP/80 during validation."
-      "$ACME_BIN" --issue -d "$DOMAIN" --standalone --keylength 2048 || rc=$?
+      "$ACME_BIN" --issue -d "$DOMAIN" --standalone --keylength "$keylength" || rc=$?
       ;;
     *)
       echo "Unsupported ACME mode: ${ACME_MODE}"
@@ -1589,11 +2226,17 @@ issue_and_install_cert() {
   fi
 
   # Reload credentials without dropping active tunnels; restart only as fallback.
-  "$ACME_BIN" --install-cert -d "$DOMAIN" \
-    --cert-file "$CERT_PATH" \
-    --ca-file "$CA_PATH" \
-    --key-file "$KEY_PATH" \
+  local -a install_args=(--install-cert -d "$DOMAIN")
+  # ECDSA certificates live in acme.sh's *_ecc directory and need --ecc on
+  # every subsequent call.
+  [[ "$keylength" == ec-* ]] && install_args+=(--ecc)
+  install_args+=(
+    --cert-file "$CERT_PATH"
+    --ca-file "$CA_PATH"
+    --key-file "$KEY_PATH"
     --reloadcmd "$CERT_RELOAD_SCRIPT"
+  )
+  "$ACME_BIN" "${install_args[@]}"
 }
 validate_acme_env() {
   case "${ACME_MODE:-dns-01}" in
@@ -1711,8 +2354,38 @@ validate_install_inputs() {
     return 1
   }
 
+  local conflicts
+  conflicts="$(conflicting_local_networks "$VPN_POOL_CIDR")"
+  if [[ -n "$conflicts" ]]; then
+    echo "Warning: VPN pool $VPN_POOL_CIDR overlaps networks already present on this host:"
+    print_indented "$conflicts"
+    echo "Routing for those networks will break for VPN clients."
+  fi
+
   [[ "$CLIENT_ISOLATION" == "0" || "$CLIENT_ISOLATION" == "1" ]] || {
     echo "Client isolation must be 0 or 1."
+    return 1
+  }
+  valid_egress_policy "$EGRESS_POLICY" || {
+    echo "Egress policy must be internet-only or open."
+    return 1
+  }
+  valid_port_list "$EGRESS_HOST_TCP_PORTS" || {
+    echo "Host TCP port list for VPN clients is invalid."
+    return 1
+  }
+  valid_port_list "$EGRESS_HOST_UDP_PORTS" || {
+    echo "Host UDP port list for VPN clients is invalid."
+    return 1
+  }
+  EGRESS_HOST_TCP_PORTS=$(normalize_port_list "$EGRESS_HOST_TCP_PORTS")
+  EGRESS_HOST_UDP_PORTS=$(normalize_port_list "$EGRESS_HOST_UDP_PORTS")
+  valid_cert_key_type "$CERT_KEY_TYPE" || {
+    echo "Certificate key type must be one of: rsa2048, rsa3072, rsa4096, ec256, ec384."
+    return 1
+  }
+  valid_ike_unique "$IKE_UNIQUE" || {
+    echo "IKE uniqueness policy must be one of: never, no, keep, replace."
     return 1
   }
   [[ "$HARDEN_INPUT" == "0" || "$HARDEN_INPUT" == "1" ]] || {
@@ -1736,7 +2409,7 @@ install_wizard() {
   echo
 
   if ! os_supported; then
-    echo "Unsupported OS. Official target: Ubuntu 22.04 / 24.04."
+    report_error "Unsupported OS. Tested releases: Ubuntu $(supported_os_list)."
     pause
     return 1
   fi
@@ -1792,6 +2465,27 @@ install_wizard() {
   fi
   CLIENT_ISOLATION=$(ask "Drop VPN client-to-client traffic (1/0)" "${CLIENT_ISOLATION:-1}")
 
+  echo
+  echo "Egress policy for VPN clients:"
+  echo "  internet-only = block cloud metadata (169.254.0.0/16), private"
+  echo "                  networks and this host's own services"
+  echo "  open          = route everything, including the hosting network"
+  EGRESS_POLICY=$(ask "Egress policy (internet-only/open)" "${EGRESS_POLICY:-$DEFAULT_EGRESS_POLICY}")
+  EGRESS_POLICY="${EGRESS_POLICY,,}"
+  if [[ "$EGRESS_POLICY" == "internet-only" ]]; then
+    echo "Under internet-only, services on this host (SSH, proxies) are not"
+    echo "reachable from the tunnel unless their ports are listed here."
+    EGRESS_HOST_TCP_PORTS=$(ask "Host TCP ports reachable from VPN clients (empty for none)" "${EGRESS_HOST_TCP_PORTS:-}")
+    EGRESS_HOST_UDP_PORTS=$(ask "Host UDP ports reachable from VPN clients (empty for none)" "${EGRESS_HOST_UDP_PORTS:-}")
+  fi
+
+  echo
+  echo "Certificate key type: rsa2048 is the most compatible, ec256 produces"
+  echo "smaller IKE_AUTH payloads and is supported by Windows 10+, iOS,"
+  echo "macOS and strongSwan clients."
+  CERT_KEY_TYPE=$(ask "Certificate key type (rsa2048/rsa3072/rsa4096/ec256/ec384)" "${CERT_KEY_TYPE:-$DEFAULT_CERT_KEY_TYPE}")
+  CERT_KEY_TYPE="${CERT_KEY_TYPE,,}"
+
   if [[ "$ACME_MODE" == "http-01" ]]; then
     echo
     echo -e "${YELLOW}HTTP-01 note:${NC} the server must be reachable from the Internet on TCP/80 during validation."
@@ -1823,14 +2517,14 @@ install_wizard() {
   echo
   echo "Installing packages..."
   if ! ensure_packages; then
-    echo "Package installation failed."
+    report_error "Package installation failed."
     pause
     return 1
   fi
 
   echo "Installing acme.sh..."
   if ! ensure_acme_installed; then
-    echo "acme.sh installation failed."
+    report_error "acme.sh installation failed."
     pause
     return 1
   fi
@@ -1847,21 +2541,21 @@ install_wizard() {
 
   echo "Enabling IPv4 forwarding..."
   if ! enable_sysctl; then
-    echo "Failed to enable IPv4 forwarding."
+    report_error "Failed to enable IPv4 forwarding."
     pause
     return 1
   fi
 
   echo "Issuing and installing RSA certificate..."
   if ! issue_and_install_cert; then
-    echo "Certificate issuance or installation failed."
+    report_error "Certificate issuance or installation failed."
     pause
     return 1
   fi
 
   echo "Generating swanctl configuration..."
   if ! generate_swanctl_conf; then
-    echo "Failed to generate swanctl configuration."
+    report_error "Failed to generate swanctl configuration."
     pause
     return 1
   fi
@@ -1869,7 +2563,7 @@ install_wizard() {
   echo "Validating swanctl configuration..."
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
   if ! swanctl --load-all >/dev/null 2>&1; then
-    echo "Generated swanctl configuration is invalid. Inspect /etc/swanctl/swanctl.conf and retry."
+    report_error "Generated swanctl configuration is invalid. Inspect /etc/swanctl/swanctl.conf and retry."
     INSTALLED=0
     save_config
     pause
@@ -1878,7 +2572,7 @@ install_wizard() {
 
   echo "Starting VPN service..."
   if ! restart_vpn_service; then
-    echo "Failed to start VPN service."
+    report_error "Failed to start VPN service."
     pause
     return 1
   fi
@@ -1886,7 +2580,7 @@ install_wizard() {
 
   echo "Applying firewall rules..."
   if ! apply_firewall_rules; then
-    echo "Failed to apply firewall rules."
+    report_error "Failed to apply firewall rules."
     pause
     return 1
   fi
@@ -1967,7 +2661,7 @@ add_or_update_user() {
   if [[ ! "$choice" =~ ^[Nn]$ ]]; then
     password=$(random_password)
   else
-    password=$(ask "Password")
+    password=$(ask_secret "Password")
     if [[ -z "$password" || "$password" == *'|'* || "$password" == *'"'* || "$password" == *"\\"* || "$password" == *$'\t'* || "$password" == *$'\n'* ]]; then
       echo "Password is empty or contains invalid characters (| \" \\ tab newline)."
       pause
@@ -1995,7 +2689,7 @@ add_or_update_user() {
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
   # --clear drops stale in-memory credentials (e.g. an old password).
   if ! swanctl --load-all --clear >/dev/null 2>&1; then
-    echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
+    report_error "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
   fi
@@ -2085,7 +2779,7 @@ remove_user_menu() {
   systemctl start "$(detect_service_name).service" >/dev/null 2>&1 || true
   # --clear ensures the removed user's secret is unloaded from charon.
   if ! swanctl --load-all --clear >/dev/null 2>&1; then
-    echo "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
+    report_error "Generated swanctl configuration is invalid. User database was updated, but VPN config reload was blocked."
     pause
     return 1
   fi
@@ -2109,9 +2803,20 @@ get_group_users() {
   done <"$USERS_DB"
 }
 
+# The group is the explicit third field; only when it is missing is it
+# inferred from the username prefix. Trimming everything after a hyphen from
+# an explicit group made hyphenated group names impossible to select.
 list_groups() {
   ensure_users_db
-  awk -F'|' 'NF && $1 !~ /^[[:space:]]*$/ && $1 != "username" {g=($3?$3:$1); sub(/-.*/,"",g); print g}' "$USERS_DB" | sort -u
+  awk -F'|' 'NF && $1 !~ /^[[:space:]]*$/ && $1 != "username" {
+    if ($3 != "") {
+      print $3
+    } else {
+      g = $1
+      sub(/-.*/, "", g)
+      print (g == "" ? "default" : g)
+    }
+  }' "$USERS_DB" | sort -u
 }
 
 select_group_prompt() {
@@ -2124,17 +2829,20 @@ select_group_prompt() {
   done < <(list_groups)
 
   if ((${#groups[@]} == 0)); then
-    echo "No groups found."
+    echo "No groups found." >&2
     return 1
   fi
 
-  echo "Available groups"
-  echo "----------------"
+  # Everything except the selected group goes to stderr: the caller reads
+  # this function through a command substitution, so anything printed on
+  # stdout would end up inside the returned value.
+  echo "Available groups" >&2
+  echo "----------------" >&2
   local i
   for i in "${!groups[@]}"; do
-    printf "%2d) %s\n" "$((i + 1))" "${groups[$i]}"
+    printf "%2d) %s\n" "$((i + 1))" "${groups[$i]}" >&2
   done
-  echo
+  echo >&2
 
   input=$(ask "Group/label to export (number or name)")
   input="$(trim "$input")"
@@ -2144,12 +2852,12 @@ select_group_prompt() {
       printf '%s\n' "${groups[$((input - 1))]}"
       return 0
     fi
-    echo "Group number out of range: $input"
+    echo "Group number out of range: $input" >&2
     return 1
   fi
 
   if ! valid_group_name "$input"; then
-    echo "Invalid group."
+    echo "Invalid group." >&2
     return 1
   fi
 
@@ -2160,7 +2868,7 @@ select_group_prompt() {
     fi
   done
 
-  echo "Group not found: $input"
+  echo "Group not found: $input" >&2
   return 1
 }
 
@@ -2212,12 +2920,18 @@ EOF_PROFILE
 
 make_ubuntu_script() {
   local host="$1" out_file="$2"
-  local ca_content="" right_subnet="0.0.0.0/0"
+  local ca_content="" ca_label="root" right_subnet="0.0.0.0/0"
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
     right_subnet="0.0.0.0/0,::/0"
   fi
-  if [[ -f "$CA_PATH" ]]; then
+  # Pin the trust anchor, not the intermediate: Let's Encrypt rotates
+  # intermediates, and a client that trusts only the intermediate stops
+  # connecting on the next rotation.
+  if [[ -f "$CA_ROOT_PATH" ]]; then
+    ca_content="$(<"$CA_ROOT_PATH")"
+  elif [[ -f "$CA_PATH" ]]; then
     ca_content="$(<"$CA_PATH")"
+    ca_label="issuer"
   fi
 
   cat >"$out_file" <<EOF_UBUNTU
@@ -2226,15 +2940,26 @@ set -euo pipefail
 read -r -p "Username: " VPN_USER
 read -r -s -p "Password: " VPN_PASS
 echo
+
+# Existing IPsec configuration on this machine is preserved.
+stamp="\$(date +%Y%m%d-%H%M%S)"
+for existing in /etc/ipsec.conf /etc/ipsec.secrets; do
+  if [[ -f "\$existing" ]]; then
+    sudo cp -a "\$existing" "\${existing}.bak.\${stamp}"
+    echo "Backed up \$existing to \${existing}.bak.\${stamp}"
+  fi
+done
+
 sudo apt-get update
 sudo apt-get install -y strongswan libcharon-extra-plugins libcharon-extauth-plugins
 EOF_UBUNTU
 
-  # charon does not use the system CA store, so ship the issuer CA with the script.
+  # charon does not use the system CA store, so ship the trust anchor with
+  # the script.
   if [[ -n "$ca_content" ]]; then
     cat >>"$out_file" <<EOF_CA_BLOCK
 sudo mkdir -p /etc/ipsec.d/cacerts
-sudo tee '/etc/ipsec.d/cacerts/${host}-ca.pem' >/dev/null <<'EOF_CA'
+sudo tee '/etc/ipsec.d/cacerts/${host}-${ca_label}.pem' >/dev/null <<'EOF_CA'
 ${ca_content}
 EOF_CA
 EOF_CA_BLOCK
@@ -2364,7 +3089,11 @@ generate_client_bundle_local() {
     return 1
   fi
 
-  local ts bundle_dir user _pass _g _platform file safe_user
+  local ts bundle_dir user _pass _g _platform file safe_user previous_umask
+  # The guides carry plaintext credentials; create every file unreadable to
+  # anyone but root instead of fixing the mode afterwards.
+  previous_umask="$(umask)"
+  umask 077
   ts=$(date +%Y%m%d-%H%M%S)
   bundle_dir="$EXPORTS_DIR/${DOMAIN}_${group}_${ts}"
   mkdir -p "$bundle_dir/windows" "$bundle_dir/ios" "$bundle_dir/macos" "$bundle_dir/ubuntu"
@@ -2416,8 +3145,8 @@ EOF_WINPS
     make_ubuntu_script "$DOMAIN" "$bundle_dir/ubuntu/${DOMAIN}-ubuntu.sh"
   fi
 
-  # Guides contain plaintext credentials; keep the bundle root-only.
   chmod -R go-rwx "$bundle_dir"
+  umask "$previous_umask"
 
   echo "Client bundle exported locally:"
   echo "$bundle_dir"
@@ -2457,8 +3186,9 @@ mt_load_config() {
   [[ -f "$MT_CONFIG_FILE" ]] || return 0
 
   local raw_port raw_domain
-  raw_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} f && /port[[:space:]]*=/ \
-    {gsub(/[^0-9]/,"",$0); print; exit}' \
+  raw_port="$(awk '/^\[server\]/{f=1;next} /^\[/{f=0} \
+    f && /^[[:space:]]*port[[:space:]]*=/ \
+    {sub(/.*=[[:space:]]*/,""); gsub(/[^0-9]/,"",$0); print; exit}' \
     "$MT_CONFIG_FILE" 2>/dev/null || true)"
   [[ -n "$raw_port" ]] && MT_PORT="$raw_port"
 
@@ -2468,9 +3198,45 @@ mt_load_config() {
     "$MT_CONFIG_FILE" 2>/dev/null || true)"
   [[ -n "$raw_domain" ]] && MT_TLS_DOMAIN="$raw_domain"
 
-  MT_SECRET="$(awk '/^\[access\.users\]/{f=1;next} /^\[/{f=0} \
-    f && /=[[:space:]]*"/{sub(/^[^=]*=[[:space:]]*"/,""); sub(/".*$/,""); print; exit}' \
-    "$MT_CONFIG_FILE" 2>/dev/null || true)"
+  MT_SECRET="$(mt_user_secret "")"
+}
+
+# Secret of a named proxy user, or of the first one when no name is given.
+# Printing the first user's secret after adding an account handed out the
+# wrong credential and made per-user revocation impossible.
+mt_user_secret() {
+  local wanted="$1"
+  [[ -f "$MT_CONFIG_FILE" ]] || return 0
+  awk -v wanted="$wanted" '
+    /^\[access\.users\]/ { in_users = 1; next }
+    /^\[/ { in_users = 0 }
+    in_users && /=[[:space:]]*"/ {
+      name = $0
+      sub(/[[:space:]]*=.*$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      value = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", value)
+      sub(/".*$/, "", value)
+      if (wanted == "" || name == wanted) {
+        print value
+        exit
+      }
+    }
+  ' "$MT_CONFIG_FILE" 2>/dev/null || true
+}
+
+mt_list_users() {
+  [[ -f "$MT_CONFIG_FILE" ]] || return 0
+  awk '
+    /^\[access\.users\]/ { in_users = 1; next }
+    /^\[/ { in_users = 0 }
+    in_users && /=[[:space:]]*"/ {
+      name = $0
+      sub(/[[:space:]]*=.*$/, "", name)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
+      if (name != "") print name
+    }
+  ' "$MT_CONFIG_FILE" 2>/dev/null || true
 }
 
 mt_validate_port() {
@@ -2512,15 +3278,34 @@ mt_get_server_ip() {
 }
 
 mt_build_link() {
+  local user="${1:-}"
   mt_load_config
-  local ip domain_hex
+  local host domain_hex secret
 
-  ip="$(mt_get_server_ip 2>/dev/null || true)"
-  ip="${ip:-YOUR_IP}"
+  if ! command -v xxd >/dev/null 2>&1; then
+    echo "link unavailable: xxd is not installed"
+    return 1
+  fi
+
+  # A public hostname survives NAT; the detected source address does not.
+  host="${DOMAIN:-}"
+  if [[ -z "$host" ]]; then
+    host="$(mt_get_server_ip 2>/dev/null || true)"
+    host="${host:-YOUR_IP}"
+  fi
+
+  secret="$MT_SECRET"
+  if [[ -n "$user" ]]; then
+    secret="$(mt_user_secret "$user")"
+  fi
+  if [[ -z "$secret" ]]; then
+    echo "link unavailable: no proxy user secret found"
+    return 1
+  fi
 
   domain_hex="$(printf '%s' "$MT_TLS_DOMAIN" | xxd -ps -c 999 | tr -d '\n')"
   printf 'tg://proxy?server=%s&port=%s&secret=ee%s%s\n' \
-    "$ip" "$MT_PORT" "$MT_SECRET" "$domain_hex"
+    "$host" "$MT_PORT" "$secret" "$domain_hex"
 }
 
 mt_service_status() {
@@ -2563,7 +3348,7 @@ mt_verify_service_started() {
     sub_state="$(systemctl show -p SubState --value "${MT_SERVICE}.service" 2>/dev/null || true)"
 
     if [[ "$active_state" == "active" && "$sub_state" == "running" ]]; then
-      ((stable++))
+      stable=$((stable + 1))
       if ((stable >= 3)); then
         return 0
       fi
@@ -2574,7 +3359,7 @@ mt_verify_service_started() {
     fi
 
     sleep 1
-    ((attempts--))
+    attempts=$((attempts - 1))
   done
 
   echo -e "${RED}MTProto proxy service failed to start${NC}"
@@ -2589,9 +3374,6 @@ mt_firewall_add() {
   mt_load_config
   iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT 2>/dev/null \
     || iptables -I INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
-  fi
 }
 
 mt_firewall_remove() {
@@ -2602,9 +3384,6 @@ mt_firewall_remove() {
       -m comment --comment "mtproto-manager" -j ACCEPT \
       || break
   done
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
-  fi
 }
 
 mt_migrate_legacy() {
@@ -2711,7 +3490,7 @@ mt_install() {
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl ca-certificates xxd iptables iptables-persistent
+  apt-get install -y curl ca-certificates xxd iptables
 
   if ! command -v curl >/dev/null 2>&1; then
     echo -e "${RED}curl is required${NC}"
@@ -2722,7 +3501,14 @@ mt_install() {
   mt_migrate_legacy
 
   tmp_bootstrap="$(mktemp /tmp/mtproto-bootstrap.XXXXXX.sh)"
-  curl -fsSL "$MT_BOOTSTRAP_URL" -o "$tmp_bootstrap"
+  # The bootstrap script is fetched from a moving branch, so its fingerprint
+  # is shown and confirmed before it is executed.
+  if ! fetch_and_confirm_script "$MT_BOOTSTRAP_URL" "$tmp_bootstrap" "$MT_BOOTSTRAP_SHA256"; then
+    rm -f "$tmp_bootstrap"
+    echo -e "${RED}Bootstrap script was not confirmed; installation aborted${NC}"
+    sleep 2
+    return 1
+  fi
   bash "$tmp_bootstrap"
   rm -f "$tmp_bootstrap"
 
@@ -2852,7 +3638,7 @@ mt_add_user() {
   if "$MT_BUDDY_BIN" user add "$username"; then
     mt_load_config
     echo
-    echo -e "${YELLOW}Link:${NC} $(mt_build_link)"
+    echo -e "${YELLOW}Link for ${username}:${NC} $(mt_build_link "$username")"
   else
     echo
     echo "See 'mtbuddy --help' for user management commands."
@@ -2878,11 +3664,6 @@ mt_show_active_ips() {
   mt_client_ips_raw | sort | uniq -c | sort -nr | head -20
 
   echo
-  echo -e "${YELLOW}Dashboard (localhost:61208, access via SSH tunnel):${NC}"
-  curl -fsS "http://127.0.0.1:61208/" 2>/dev/null | head -5 \
-    || echo "Dashboard unavailable"
-
-  echo
   pause
 }
 
@@ -2902,7 +3683,14 @@ mt_show_status_link() {
   echo -e "${YELLOW}TLS domain:${NC} ${MT_TLS_DOMAIN} (permanent)"
   echo -e "${YELLOW}Active IPs:${NC} $(mt_client_ip_count 2>/dev/null || echo 0)"
   echo
-  echo -e "${YELLOW}Link:${NC} $(mt_build_link 2>/dev/null || true)"
+
+  local user found=0
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    found=1
+    echo -e "${YELLOW}${user}:${NC} $(mt_build_link "$user" 2>/dev/null || true)"
+  done < <(mt_list_users)
+  ((found)) || echo "No proxy users configured."
   echo
   pause
 }
@@ -2911,11 +3699,17 @@ mt_status_block() {
   mt_load_config
   local install_status service_status users link
 
+  local proxy_users=0
   if mt_is_installed; then
     install_status="installed"
     service_status="$(mt_service_status)"
     users="$(mt_client_ip_count 2>/dev/null || echo 0)"
-    link="$(mt_build_link 2>/dev/null || true)"
+    proxy_users="$(mt_list_users | grep -c . || true)"
+    if ((proxy_users == 1)); then
+      link="$(mt_build_link 2>/dev/null || true)"
+    else
+      link="${proxy_users} users — see status/link"
+    fi
   else
     install_status="not installed"
     service_status="-"
@@ -2938,6 +3732,9 @@ mt_status_block() {
   echo
 }
 
+# Menu keys stay in the same place regardless of service state: an entry
+# that moves under the cursor is how an operator stops a proxy while meaning
+# to update it. Removal sits on its own key, away from the routine actions.
 mtproxy_menu() {
   local choice
 
@@ -2945,59 +3742,7 @@ mtproxy_menu() {
     clear
     mt_status_block
 
-    if mt_is_installed; then
-      if mt_service_is_running; then
-        menu_item 1 "Remove proxy"
-        menu_item 2 "Restart proxy"
-        menu_item 3 "Stop proxy"
-        menu_item 4 "Update proxy"
-        menu_item 5 "Add user"
-        menu_item 6 "Show active IPs"
-        menu_item 7 "Show status/link"
-        menu_item 8 "Show logs"
-        echo
-        menu_enter_hint "Back"
-        echo
-        read_menu_choice choice
-
-        case "$choice" in
-          1) mt_remove ;;
-          2) mt_restart_or_start_service ;;
-          3) mt_stop ;;
-          4) mt_update ;;
-          5) mt_add_user ;;
-          6) mt_show_active_ips ;;
-          7) mt_show_status_link ;;
-          8) mt_show_logs ;;
-          "" | 0) return 0 ;;
-          *) invalid_choice ;;
-        esac
-      else
-        menu_item 1 "Remove proxy"
-        menu_item 2 "Start proxy"
-        menu_item 3 "Update proxy"
-        menu_item 4 "Add user"
-        menu_item 5 "Show active IPs"
-        menu_item 6 "Show status/link"
-        menu_item 7 "Show logs"
-        echo
-        menu_enter_hint "Back"
-        echo
-        read_menu_choice choice
-
-        case "$choice" in
-          1) mt_remove ;;
-          2) mt_restart_or_start_service ;;
-          3) mt_update ;;
-          4) mt_add_user ;;
-          5) mt_show_active_ips ;;
-          6) mt_show_status_link ;;
-          7) mt_show_logs ;;
-          "" | 0) return 0 ;;
-          *) invalid_choice ;;
-        esac
-      fi
-    else
+    if ! mt_is_installed; then
       menu_item 1 "Install proxy"
       echo
       menu_enter_hint "Back"
@@ -3009,7 +3754,40 @@ mtproxy_menu() {
         "" | 0) return 0 ;;
         *) invalid_choice ;;
       esac
+      continue
     fi
+
+    if mt_service_is_running; then
+      menu_item 1 "Restart proxy"
+    else
+      menu_item 1 "Start proxy"
+    fi
+    menu_item 2 "Stop proxy"
+    menu_item 3 "Update proxy"
+    echo
+    menu_item 4 "Add user"
+    menu_item 5 "Show active IPs"
+    menu_item 6 "Show status/links"
+    menu_item 7 "Show logs"
+    echo
+    menu_item 9 "Remove proxy"
+    echo
+    menu_enter_hint "Back"
+    echo
+    read_menu_choice choice
+
+    case "$choice" in
+      1) mt_restart_or_start_service ;;
+      2) mt_stop ;;
+      3) mt_update ;;
+      4) mt_add_user ;;
+      5) mt_show_active_ips ;;
+      6) mt_show_status_link ;;
+      7) mt_show_logs ;;
+      9) mt_remove ;;
+      "" | 0) return 0 ;;
+      *) invalid_choice ;;
+    esac
   done
 }
 
@@ -3056,6 +3834,11 @@ show_diagnostics() {
   echo "Pool CIDR:    ${VPN_POOL_CIDR}"
   echo "Pool range:   ${VPN_POOL_RANGE}"
   echo "IPv6 mode:    ${IPV6_MODE:-off}"
+  echo "Egress policy: ${EGRESS_POLICY:-internet-only}"
+  echo "Host ports from pool: ${EGRESS_HOST_TCP_PORTS:-none} tcp / ${EGRESS_HOST_UDP_PORTS:-none} udp"
+  echo "Cert key type: ${CERT_KEY_TYPE:-$DEFAULT_CERT_KEY_TYPE}"
+  echo "IKE uniqueness: ${IKE_UNIQUE:-never}"
+  echo "strongSwan:   $(strongswan_version || echo unknown)"
   if [[ "${IPV6_MODE:-off}" != "off" ]]; then
     echo "IPv6 pool:    ${VPN_POOL6_CIDR}"
     echo "IPv6 forward: $(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || echo '?')"
@@ -3093,6 +3876,21 @@ show_diagnostics() {
   echo "MSS clamp:     $(has_mss_clamp_rule && echo yes || echo no)"
   echo "Isolation:     $(has_isolation_rule && echo yes || echo no) (configured: ${CLIENT_ISOLATION:-1})"
   echo "Hardening:     $(has_harden_chain && echo active || echo off) (configured: ${HARDEN_INPUT:-0})"
+  echo "Egress chain:  $(has_egress_chain && echo active || echo off) (configured: ${EGRESS_POLICY:-internet-only})"
+  echo "Host chain:    $(has_host_chain && echo active || echo off)"
+  echo
+  echo "Managed state"
+  echo "-------------"
+  local stale
+  stale="$(stale_artifacts)"
+  if [[ -n "$stale" ]]; then
+    echo "Stale generated files (regenerated on next start):"
+    print_indented "$stale"
+  else
+    echo "Generated files: current (v${SCRIPT_VERSION})"
+  fi
+  echo "Cert check timer: $(systemctl is-active ikev2-manager-certcheck.timer 2>/dev/null || echo inactive)"
+  echo "Failed EAP auths (24h): $(failed_auth_count)"
   echo
   echo "Recent VPN log"
   echo "--------------"
@@ -3108,13 +3906,13 @@ reissue_certificate() {
   read -r -p "Continue? [y/N]: " ans || true
   [[ "$ans" =~ ^[Yy]$ ]] || return 0
   if ! issue_and_install_cert; then
-    echo "Certificate reissue failed."
+    report_error "Certificate reissue failed."
     pause
     return 1
   fi
   save_config
   if ! reload_vpn_credentials; then
-    echo "VPN credentials reload failed after certificate update."
+    report_error "VPN credentials reload failed after certificate update."
     pause
     return 1
   fi
@@ -3125,7 +3923,7 @@ reissue_certificate() {
 reapply_firewall() {
   render_header
   if ! apply_firewall_rules; then
-    echo "Failed to reapply firewall rules."
+    report_error "Failed to reapply firewall rules."
     pause
     return 1
   fi
@@ -3141,11 +3939,14 @@ firewall_hardening_menu() {
   echo "Extra TCP:      ${HARDEN_TCP_PORTS:-none}"
   echo "Extra UDP:      ${HARDEN_UDP_PORTS:-none}"
   echo "Isolation:      ${CLIENT_ISOLATION:-1} (1 = drop client-to-client)"
+  echo "Egress policy:  ${EGRESS_POLICY:-internet-only}"
+  echo "Host TCP/UDP:   ${EGRESS_HOST_TCP_PORTS:-none} / ${EGRESS_HOST_UDP_PORTS:-none} (reachable from the tunnel)"
   echo
-  echo "SSH, ICMP, IKEv2/ESP and the MTProto proxy port are always allowed."
+  echo "SSH, ICMP, IKEv2/ESP, DHCP, the MTProto proxy port and (in HTTP-01"
+  echo "mode) TCP/80 for certificate renewal are always allowed."
   echo
 
-  local harden tcp_ports udp_ports isolation
+  local harden tcp_ports udp_ports isolation egress
   harden=$(ask "Enable inbound hardening (1/0)" "${HARDEN_INPUT:-0}")
   [[ "$harden" == "0" || "$harden" == "1" ]] || {
     echo "Inbound hardening must be 0 or 1."
@@ -3178,6 +3979,36 @@ firewall_hardening_menu() {
     return 1
   }
 
+  echo
+  echo "internet-only blocks cloud metadata, private networks and this host's"
+  echo "own services for VPN clients; open routes everything."
+  egress=$(ask "Egress policy (internet-only/open)" "${EGRESS_POLICY:-$DEFAULT_EGRESS_POLICY}")
+  egress="${egress,,}"
+  valid_egress_policy "$egress" || {
+    echo "Egress policy must be internet-only or open."
+    pause
+    return 1
+  }
+
+  local host_tcp="${EGRESS_HOST_TCP_PORTS:-}" host_udp="${EGRESS_HOST_UDP_PORTS:-}"
+  if [[ "$egress" == "internet-only" ]]; then
+    host_tcp=$(ask "Host TCP ports reachable from VPN clients (empty for none)" "$host_tcp")
+    host_udp=$(ask "Host UDP ports reachable from VPN clients (empty for none)" "$host_udp")
+    valid_port_list "$host_tcp" || {
+      echo "Host TCP port list is invalid."
+      pause
+      return 1
+    }
+    valid_port_list "$host_udp" || {
+      echo "Host UDP port list is invalid."
+      pause
+      return 1
+    }
+  fi
+
+  EGRESS_POLICY="$egress"
+  EGRESS_HOST_TCP_PORTS=$(normalize_port_list "$host_tcp")
+  EGRESS_HOST_UDP_PORTS=$(normalize_port_list "$host_udp")
   HARDEN_INPUT="$harden"
   HARDEN_TCP_PORTS=$(normalize_port_list "$tcp_ports")
   HARDEN_UDP_PORTS=$(normalize_port_list "$udp_ports")
@@ -3185,7 +4016,7 @@ firewall_hardening_menu() {
   save_config
 
   if ! apply_firewall_rules; then
-    echo "Failed to apply firewall rules."
+    report_error "Failed to apply firewall rules."
     pause
     return 1
   fi
@@ -3206,7 +4037,7 @@ stop_vpn_service() {
 restart_vpn_menu() {
   render_header
   if ! restart_vpn_service; then
-    echo "VPN service restart failed."
+    report_error "VPN service restart failed."
     pause
     return 1
   fi
@@ -3218,7 +4049,7 @@ restart_vpn_menu() {
 start_vpn_menu() {
   render_header
   if ! start_vpn_service; then
-    echo "VPN service start failed."
+    report_error "VPN service start failed."
     pause
     return 1
   fi
@@ -3230,7 +4061,7 @@ start_vpn_menu() {
 stop_vpn_menu() {
   render_header
   if ! stop_vpn_service; then
-    echo "VPN service stop failed."
+    report_error "VPN service stop failed."
     pause
     return 1
   fi
@@ -3242,6 +4073,44 @@ show_recent_logs() {
   render_header
   journalctl -u "$(detect_service_name).service" -n 80 --no-pager 2>/dev/null || true
   pause
+}
+
+# Who is connected right now. The manager could terminate a user's sessions
+# but never showed them.
+show_active_sessions() {
+  render_header
+  echo "Active VPN sessions"
+  echo "-------------------"
+  if ! command -v swanctl >/dev/null 2>&1; then
+    echo "swanctl is not available."
+    pause
+    return 0
+  fi
+  if ! service_active; then
+    echo "VPN service is not running."
+    pause
+    return 0
+  fi
+
+  local output
+  output="$(swanctl --list-sas --noblock 2>/dev/null || swanctl --list-sas 2>/dev/null || true)"
+  if [[ -z "$output" ]]; then
+    echo "No established IKE SAs."
+  else
+    printf '%s\n' "$output"
+  fi
+  echo
+  echo "Failed EAP authentications in the last 24h: $(failed_auth_count)"
+  pause
+}
+
+# Counts rejected EAP attempts in the journal; a spike means someone is
+# guessing passwords.
+failed_auth_count() {
+  local service
+  service="$(detect_service_name)"
+  journalctl -u "${service}.service" --since "24 hours ago" --no-pager 2>/dev/null \
+    | grep -c -E "EAP method EAP_MSCHAPV2 failed|authentication of .* failed|EAP_NAK" || true
 }
 
 vpn_users_menu() {
@@ -3277,11 +4146,14 @@ service_tools_menu() {
     echo "------------"
     menu_item 1 "Reissue certificate"
     menu_item 2 "Reapply firewall rules"
-    menu_item 3 "Inbound hardening / client isolation"
+    menu_item 3 "Inbound hardening / client isolation / egress policy"
+    echo
     menu_item 4 "Show diagnostics"
-    menu_item 5 "Show logs"
-    menu_item 6 "Show client info"
-    menu_item 7 "Uninstall / cleanup"
+    menu_item 5 "Show active VPN sessions"
+    menu_item 6 "Show logs"
+    menu_item 7 "Show client info"
+    echo
+    menu_item 9 "Uninstall / cleanup"
     echo
     menu_enter_hint "Back"
     echo
@@ -3291,13 +4163,26 @@ service_tools_menu() {
       2) reapply_firewall ;;
       3) firewall_hardening_menu ;;
       4) show_diagnostics ;;
-      5) show_recent_logs ;;
-      6) show_client_info ;;
-      7) uninstall_cleanup ;;
+      5) show_active_sessions ;;
+      6) show_recent_logs ;;
+      7) show_client_info ;;
+      9) uninstall_cleanup ;;
       "" | 0) return 0 ;;
       *) invalid_choice ;;
     esac
   done
+}
+
+# Anything this manager owns that is still on disk after a failed or partial
+# installation. Without this the not-installed menu offered no way out of a
+# half-configured host.
+has_leftovers() {
+  local path
+  for path in "$MANAGER_DIR" "$SWANCTL_CONF" "$FIREWALL_SCRIPT" "$FIREWALL_SERVICE" \
+    "$SYSCTL_FILE" "$MODULES_LOAD_FILE" "$CERT_CHECK_TIMER"; do
+    [[ -e "$path" ]] && return 0
+  done
+  return 1
 }
 
 main_menu_not_installed() {
@@ -3311,8 +4196,11 @@ main_menu_not_installed() {
     menu_item 1 "Install IKEv2 server"
     echo
     menu_item 2 "MTProto proxy manager"
-    echo
     menu_item 3 "Show diagnostics"
+    if has_leftovers; then
+      echo
+      menu_item 9 "Uninstall / cleanup leftovers"
+    fi
     echo
     menu_enter_hint "Exit"
     echo
@@ -3321,6 +4209,13 @@ main_menu_not_installed() {
       1) install_wizard ;;
       2) mtproxy_menu ;;
       3) show_diagnostics ;;
+      9)
+        if has_leftovers; then
+          uninstall_cleanup
+        else
+          invalid_choice
+        fi
+        ;;
       "" | 0) exit 0 ;;
       *) invalid_choice ;;
     esac
@@ -3338,56 +4233,157 @@ main_menu_installed() {
 
     if service_active; then
       menu_item 1 "Restart VPN service"
-      menu_item 2 "Stop VPN service"
-      menu_item 3 "Re-run install wizard"
-      echo
-      menu_item 4 "VPN users"
-      echo
-      menu_item 5 "MTProto proxy manager"
-      echo
-      menu_item 6 "Service menu"
-      echo
-      menu_enter_hint "Exit"
-      echo
-      read_menu_choice choice
-      case "$choice" in
-        1) restart_vpn_menu ;;
-        2) stop_vpn_menu ;;
-        3) install_wizard ;;
-        4) vpn_users_menu ;;
-        5) mtproxy_menu ;;
-        6) service_tools_menu ;;
-        "" | 0) exit 0 ;;
-        *) invalid_choice ;;
-      esac
     else
       menu_item 1 "Start VPN service"
-      menu_item 2 "Re-run install wizard"
-      echo
-      menu_item 3 "VPN users"
-      echo
-      menu_item 4 "MTProto proxy manager"
-      echo
-      menu_item 5 "Service menu"
-      echo
-      menu_enter_hint "Exit"
-      echo
-      read_menu_choice choice
-      case "$choice" in
-        1) start_vpn_menu ;;
-        2) install_wizard ;;
-        3) vpn_users_menu ;;
-        4) mtproxy_menu ;;
-        5) service_tools_menu ;;
-        "" | 0) exit 0 ;;
-        *) invalid_choice ;;
-      esac
     fi
+    menu_item 2 "Stop VPN service"
+    menu_item 3 "Re-run install wizard"
+    echo
+    menu_item 4 "VPN users"
+    menu_item 5 "MTProto proxy manager"
+    menu_item 6 "Service menu"
+    echo
+    menu_enter_hint "Exit"
+    echo
+    read_menu_choice choice
+    case "$choice" in
+      1)
+        if service_active; then
+          restart_vpn_menu
+        else
+          start_vpn_menu
+        fi
+        ;;
+      2) stop_vpn_menu ;;
+      3) install_wizard ;;
+      4) vpn_users_menu ;;
+      5) mtproxy_menu ;;
+      6) service_tools_menu ;;
+      "" | 0) exit 0 ;;
+      *) invalid_choice ;;
+    esac
   done
 }
 
+usage() {
+  cat <<EOF_USAGE
+ikev2-manager ${SCRIPT_VERSION}
+
+Usage: ikev2-manager.sh [command]
+
+Without a command an interactive menu is started (requires a terminal).
+
+Commands:
+  --check        Report installation state and exit non-zero on a problem
+  --reconcile    Regenerate managed files and reapply firewall/sysctl state
+  --diagnostics  Print the full diagnostics report and exit
+  --version      Print the version and exit
+  --help         Print this help and exit
+
+Supported: Ubuntu $(supported_os_list)
+EOF_USAGE
+}
+
+# Non-interactive health report. Exits non-zero when something needs
+# attention, so it can be used from cron or a monitoring check.
+state_check() {
+  local problems=0 days stale
+
+  echo "ikev2-manager ${SCRIPT_VERSION}"
+  echo "OS:            $(os_label)"
+  if ! effective_installed; then
+    echo "Install state: not installed"
+    return 1
+  fi
+  echo "Install state: installed"
+  echo "Domain:        ${DOMAIN:-unset}"
+  echo "Service:       $(systemctl is-active "$(detect_service_name).service" 2>/dev/null || echo unknown)"
+  service_active || problems=1
+
+  if days="$(cert_days_left 2>/dev/null)"; then
+    echo "Certificate:   ${days}d left"
+    ((days <= 21)) && problems=1
+  else
+    echo "Certificate:   unreadable"
+    problems=1
+  fi
+
+  echo "Users:         $(count_users)"
+  echo "Conntrack:     $(conntrack_status)"
+  echo "NAT rule:      $(has_nat_rule && echo yes || echo no)"
+  has_nat_rule || problems=1
+  echo "Forwarding:    $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
+
+  if [[ "${EGRESS_POLICY:-}" == "internet-only" ]] && ! has_egress_chain; then
+    echo "Egress chain:  missing"
+    problems=1
+  fi
+
+  stale="$(stale_artifacts)"
+  if [[ -n "$stale" ]]; then
+    echo "Stale files:"
+    print_indented "$stale"
+    problems=1
+  fi
+
+  return "$problems"
+}
+
 main() {
+  case "${1:-}" in
+    --version | -V)
+      echo "ikev2-manager ${SCRIPT_VERSION}"
+      return 0
+      ;;
+    --help | -h)
+      usage
+      return 0
+      ;;
+    --check)
+      NONINTERACTIVE=1
+      require_root
+      load_config
+      state_check
+      return $?
+      ;;
+    --reconcile)
+      NONINTERACTIVE=1
+      require_root
+      load_config
+      if ! effective_installed; then
+        echo "Not installed; nothing to reconcile."
+        return 1
+      fi
+      reconcile_managed_state force
+      state_check
+      return $?
+      ;;
+    --diagnostics)
+      NONINTERACTIVE=1
+      require_root
+      load_config
+      show_diagnostics
+      return 0
+      ;;
+    "") ;;
+    *)
+      echo "Unknown command: $1"
+      usage
+      return 1
+      ;;
+  esac
+
   require_root
+  if [[ ! -t 0 ]]; then
+    echo "This script needs a terminal for its menu."
+    echo "Run it from an interactive shell, or use --check / --reconcile / --diagnostics."
+    exit 1
+  fi
+
+  load_config
+  migrate_config
+  reconcile_managed_state
+
   while true; do
     load_config
     if effective_installed; then
