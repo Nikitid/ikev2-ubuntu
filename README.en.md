@@ -116,8 +116,8 @@ See [AGENTS.md](AGENTS.md) for repository-specific working rules.
 ## Security
 
 Do not publish `/opt/ikev2-manager` state, passwords, certificates, private
-keys, or client bundles. See [SECURITY.md](SECURITY.md) for vulnerability
-reporting guidance.
+keys, or client bundles. Report a vulnerability through a private security
+advisory on GitHub.
 
 ## License
 
