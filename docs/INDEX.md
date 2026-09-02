@@ -11,7 +11,7 @@ Each entry is `line  name  - purpose`, where the purpose is the first line of
 the comment above the function. Files under 300 lines are omitted: reading
 those whole is cheap enough.
 
-## scripts/ikev2-manager.sh - 4399 lines
+## scripts/ikev2-manager.sh - 4401 lines
 
 134  report_error  - Reports a failure to the operator and remembers it for the menu header.
 140  require_root
@@ -115,88 +115,88 @@ those whole is cheap enough.
 1670  write_firewall_service
 1690  apply_firewall_rules
 1700  remove_firewall_rules
-1757  forwarding_used_by_others  - Other software on the host may depend on forwarding (Docker, k8s, another
-1777  disable_sysctl
-1789  cleanup_acme_binding
-1798  cleanup_managed_files
-1817  purge_vpn_packages  - Only packages this manager installed are purged, and only the strongSwan
-1850  uninstall_cleanup
-1902  ensure_kernel_ipsec_support
-1945  enable_sysctl
-1990  generated_is_current  - True when a generated file carries the marker of the running version.
-1998  stale_artifacts  - Lists the managed artifacts that are missing or were written by an older
-2009  reconcile_managed_state  - Upgrading the script used to leave every generated artifact behind at its
-2036  escape_swanctl
-2043  generate_swanctl_conf
-2145  load_swanctl
-2151  reload_vpn_credentials
-2161  terminate_user_sas  - Best-effort: terminate IKE SAs whose identity matches the given username,
-2174  issue_and_install_cert
-2241  validate_acme_env
-2269  validate_install_inputs
-2406  install_wizard
-2595  random_password
-2599  ensure_users_db
-2606  migrate_users_db
-2633  add_or_update_user
-2710  list_users_menu
-2732  remove_user_menu
-2792  get_group_users
-2809  list_groups  - The group is the explicit third field; only when it is missing is it
-2822  select_group_prompt
-2875  make_ios_mobileconfig
-2921  make_ubuntu_script
-2992  credentials_html_for_platform
-3000  windows_message_file
-3034  ios_message_file
-3051  ubuntu_message_file
-3066  generate_client_bundle_local
-3169  mt_is_installed
-3173  mt_require_installed
-3181  mt_load_config
-3207  mt_user_secret  - Secret of a named proxy user, or of the first one when no name is given.
-3228  mt_list_users
-3242  mt_validate_port
-3249  mt_port_in_use
-3254  mt_get_server_ip
-3280  mt_build_link
-3311  mt_service_status
-3334  mt_service_is_running
-3343  mt_verify_service_started
-3373  mt_firewall_add
-3379  mt_firewall_remove
-3389  mt_migrate_legacy
-3440  mt_client_ips_raw
-3449  mt_client_ip_count
-3453  mt_install
-3548  mt_remove
-3574  mt_restart_or_start_service
-3591  mt_stop
-3605  mt_update
-3626  mt_add_user
-3650  mt_show_active_ips
-3670  mt_show_logs
-3678  mt_show_status_link
-3698  mt_status_block
-3738  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
-3794  show_client_info
-3822  show_diagnostics
-3901  reissue_certificate
-3923  reapply_firewall
-3934  firewall_hardening_menu
-4027  start_vpn_service
-4032  stop_vpn_service
-4037  restart_vpn_menu
-4049  start_vpn_menu
-4061  stop_vpn_menu
-4072  show_recent_logs
-4080  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
-4109  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
-4116  vpn_users_menu
-4141  service_tools_menu
-4179  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
-4188  main_menu_not_installed
-4225  main_menu_installed
-4268  usage
-4289  state_check  - Non-interactive health report. Exits non-zero when something needs
-4332  main
+1759  forwarding_used_by_others  - Other software on the host may depend on forwarding (Docker, k8s, another
+1779  disable_sysctl
+1791  cleanup_acme_binding
+1800  cleanup_managed_files
+1819  purge_vpn_packages  - Only packages this manager installed are purged, and only the strongSwan
+1852  uninstall_cleanup
+1904  ensure_kernel_ipsec_support
+1947  enable_sysctl
+1992  generated_is_current  - True when a generated file carries the marker of the running version.
+2000  stale_artifacts  - Lists the managed artifacts that are missing or were written by an older
+2011  reconcile_managed_state  - Upgrading the script used to leave every generated artifact behind at its
+2038  escape_swanctl
+2045  generate_swanctl_conf
+2147  load_swanctl
+2153  reload_vpn_credentials
+2163  terminate_user_sas  - Best-effort: terminate IKE SAs whose identity matches the given username,
+2176  issue_and_install_cert
+2243  validate_acme_env
+2271  validate_install_inputs
+2408  install_wizard
+2597  random_password
+2601  ensure_users_db
+2608  migrate_users_db
+2635  add_or_update_user
+2712  list_users_menu
+2734  remove_user_menu
+2794  get_group_users
+2811  list_groups  - The group is the explicit third field; only when it is missing is it
+2824  select_group_prompt
+2877  make_ios_mobileconfig
+2923  make_ubuntu_script
+2994  credentials_html_for_platform
+3002  windows_message_file
+3036  ios_message_file
+3053  ubuntu_message_file
+3068  generate_client_bundle_local
+3171  mt_is_installed
+3175  mt_require_installed
+3183  mt_load_config
+3209  mt_user_secret  - Secret of a named proxy user, or of the first one when no name is given.
+3230  mt_list_users
+3244  mt_validate_port
+3251  mt_port_in_use
+3256  mt_get_server_ip
+3282  mt_build_link
+3313  mt_service_status
+3336  mt_service_is_running
+3345  mt_verify_service_started
+3375  mt_firewall_add
+3381  mt_firewall_remove
+3391  mt_migrate_legacy
+3442  mt_client_ips_raw
+3451  mt_client_ip_count
+3455  mt_install
+3550  mt_remove
+3576  mt_restart_or_start_service
+3593  mt_stop
+3607  mt_update
+3628  mt_add_user
+3652  mt_show_active_ips
+3672  mt_show_logs
+3680  mt_show_status_link
+3700  mt_status_block
+3740  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
+3796  show_client_info
+3824  show_diagnostics
+3903  reissue_certificate
+3925  reapply_firewall
+3936  firewall_hardening_menu
+4029  start_vpn_service
+4034  stop_vpn_service
+4039  restart_vpn_menu
+4051  start_vpn_menu
+4063  stop_vpn_menu
+4074  show_recent_logs
+4082  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
+4111  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
+4118  vpn_users_menu
+4143  service_tools_menu
+4181  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
+4190  main_menu_not_installed
+4227  main_menu_installed
+4270  usage
+4291  state_check  - Non-interactive health report. Exits non-zero when something needs
+4334  main
