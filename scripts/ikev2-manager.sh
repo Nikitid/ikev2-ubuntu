@@ -1747,7 +1747,9 @@ remove_firewall_rules() {
   # them, and rewriting them here would capture unrelated rules.
   for chain in "$EGRESS_CHAIN" "$HOST_CHAIN" "$HARDEN_CHAIN"; do
     iptables -X "$chain" 2>/dev/null || true
-    command -v ip6tables >/dev/null 2>&1 && ip6tables -X "$chain" 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -X "$chain" 2>/dev/null || true
+    fi
   done
 }
 
