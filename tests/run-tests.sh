@@ -303,6 +303,7 @@ max_connections = 512
 
 [censorship]
 tls_domain = "rutube.ru"
+tls_domains = ["ok.ru", "rutube.ru"]
 mask = true
 mask_port = 8443
 
@@ -323,6 +324,23 @@ bob" "$(mt_list_users)"
 mt_load_config
 assert_eq "mt_load_config reads the server port" "1443" "$MT_PORT"
 assert_eq "mt_load_config reads the TLS domain" "rutube.ru" "$MT_TLS_DOMAIN"
+
+# The primary domain leads and is not repeated when it also appears in the
+# array: one link per domain, and the first one is the link already handed out.
+assert_eq "mt_tls_domains lists the primary first and deduplicates" "rutube.ru
+ok.ru" "$(mt_tls_domains)"
+# DOMAIN is what the operator configured for the VPN; the link must use it
+# rather than probing the network for an address.
+assert_eq "mt_build_link honours an explicit domain" \
+  "tg://proxy?server=vpn.example&port=1443&secret=eeaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6f6b2e7275" \
+  "$(DOMAIN="vpn.example" mt_build_link "" "ok.ru")"
+
+MT_TLS_DOMAINS_EXTRA="ok.ru, dzen.ru"
+assert_eq "mt_tls_domains_array renders a TOML array" '["ok.ru", "dzen.ru"]' \
+  "$(mt_tls_domains_array)"
+MT_TLS_DOMAINS_EXTRA=""
+assert_eq "mt_tls_domains_array renders empty when there are no extras" '[]' \
+  "$(mt_tls_domains_array)"
 
 # ---------------------------------------------------------------------------
 # Generated artifacts.
