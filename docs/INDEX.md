@@ -11,208 +11,208 @@ Each entry is `line  name  - purpose`, where the purpose is the first line of
 the comment above the function. Files under 300 lines are omitted: reading
 those whole is cheap enough.
 
-## scripts/ikev2-manager.sh - 4757 lines
+## scripts/ikev2-manager.sh - 4776 lines
 
-142  report_error  - Reports a failure to the operator and remembers it for the menu header.
-148  require_root
-155  ensure_manager_dir
-160  load_config
-204  migrate_config  - Config files written before schema 2 simply lack the newer keys; the
-211  effective_installed
-215  save_config
-253  os_supported
-265  supported_os_list
-270  os_label
-280  detect_service_name
-292  service_active
-297  restart_vpn_service
-306  detect_uplink_if
-310  detect_default_dns
-321  normalize_dns_list
-350  csv_list_contains
-358  append_missing_csv_items
-370  ensure_apple_esp_proposals
-375  conntrack_target_max
-384  conntrack_status
-407  dns_list_drop_ipv6  - Drop IPv6 resolvers from a comma-separated DNS list; they are unreachable
-417  valid_ipv4
-426  ip_to_int
-432  cidr_contains
-446  cidr_overlaps  - True when two IPv4 CIDRs share any address.
-459  conflicting_local_networks  - Networks already configured on this host that would collide with the pool.
-470  valid_ipv6
-500  valid_ipv6_cidr
-509  valid_ipv6_mode
-516  host_has_global_ipv6
-520  valid_cidr
-529  valid_range
-539  valid_port
-545  valid_port_list  - Comma/space separated TCP/UDP port list; empty input is valid (no ports).
-554  normalize_port_list  - Canonical form: comma-separated, duplicates removed, original order kept.
-566  valid_domain_name
-585  valid_dns_provider
-589  valid_username
-595  valid_group_name
-601  valid_platform
-608  valid_egress_policy
-615  valid_cert_key_type
-623  acme_keylength_for  - acme.sh spells key types differently from the config value.
-634  valid_ike_unique
-641  strongswan_version
-649  strongswan_at_least  - Compares the running strongSwan against major.minor.patch arguments.
-661  infer_group_from_username
-667  normalize_platform
-680  html_escape
-690  print_indented  - Prints a multi-line value indented, one line per row.
-698  trim
-705  new_uuid
-720  interface_exists
-724  detect_topology_hint
-737  count_users
-745  cert_public_key_alg
-750  cert_days_left
-760  cert_issuer_cn
-766  ca_chain_file_count
-775  has_nat_rule
-780  has_forward_rule_out
-785  has_forward_rule_in
-790  has_mss_clamp_rule
-794  has_isolation_rule
-798  has_harden_chain
-802  has_egress_chain
-806  has_host_chain
-812  ipt_del_rule  - Rule helpers used by the manager itself (the generated firewall script
-820  ipt_drop_chain
-828  status_line
-835  menu_item
-841  menu_enter_hint
-846  read_menu_choice
-857  acme_mode_from_choice
-867  select_acme_mode
-893  invalid_choice
-898  render_header
-974  pause
-979  ask
-994  ask_secret  - Secrets must not end up in the terminal scrollback or in a recorded
-1001  ask_secret_multiline_generic
-1022  ask_acme_provider_env
-1046  backup_file
-1062  prune_backups  - Old certificates and private keys are liabilities; keep only the most
-1074  fetch_and_confirm_script  - Downloads a remote installer and refuses to run it unattended: the operator
-1100  write_certificate_reload_script
-1204  write_certificate_check_service  - acme.sh renews from cron with its output sent to /dev/null. A silent
-1273  ensure_packages  - Records which of the required packages were actually missing, so that
-1301  ensure_acme_installed
-1346  detect_ssh_ports  - Ports sshd actually listens on, resolved while the manager is running and
-1357  write_firewall_script
-1393  ipt_ins  - --------------------------------------------------------------------------
-1400  ipt_app
-1407  ipt_del
-1415  ipt_chain_reset
-1421  ipt_chain_drop
-1431  dns_servers_v4  - Client DNS servers of the matching family; they stay reachable even when
-1440  dns_servers_v6
-1678  write_firewall_service
-1698  apply_firewall_rules
-1708  remove_firewall_rules
-1767  forwarding_used_by_others  - Other software on the host may depend on forwarding (Docker, k8s, another
-1787  disable_sysctl
-1799  cleanup_acme_binding
-1808  cleanup_managed_files
-1827  purge_vpn_packages  - Only packages this manager installed are purged, and only the strongSwan
-1860  uninstall_cleanup
-1912  ensure_kernel_ipsec_support
-1955  enable_sysctl
-2000  generated_is_current  - True when a generated file carries the marker of the running version.
-2008  stale_artifacts  - Lists the managed artifacts that are missing or were written by an older
-2019  reconcile_managed_state  - Upgrading the script used to leave every generated artifact behind at its
-2046  escape_swanctl
-2053  generate_swanctl_conf
-2155  load_swanctl
-2161  reload_vpn_credentials
-2171  terminate_user_sas  - Best-effort: terminate IKE SAs whose identity matches the given username,
-2184  issue_and_install_cert
-2251  validate_acme_env
-2279  validate_install_inputs
-2416  install_wizard
-2605  random_password
-2609  ensure_users_db
-2616  migrate_users_db
-2643  add_or_update_user
-2720  list_users_menu
-2742  remove_user_menu
-2802  get_group_users
-2819  list_groups  - The group is the explicit third field; only when it is missing is it
-2832  select_group_prompt
-2885  make_ios_mobileconfig
-2931  make_ubuntu_script
-3002  credentials_html_for_platform
-3010  windows_message_file
-3044  ios_message_file
-3061  ubuntu_message_file
-3076  generate_client_bundle_local
-3179  mt_is_installed
-3183  mt_require_installed
-3191  mt_load_config
-3217  mt_user_secret  - Secret of a named proxy user, or of the first one when no name is given.
-3238  mt_list_users
-3254  mt_users_block  - Current users as TOML assignments, so a config rewrite keeps every secret
-3264  mt_valid_user_name
-3269  mt_random_secret  - Proxy secrets are 32 hex characters and are embedded verbatim in the link.
-3277  mt_validate_port
-3284  mt_port_in_use
-3289  mt_get_server_ip
-3317  mt_public_host  - The host clients dial. A public name survives NAT and a provider changing
-3325  mt_build_link
-3353  mt_release_asset  - telemt publishes static musl builds, so the binary does not depend on the
-3361  mt_latest_version
-3366  mt_installed_version
-3373  mt_fetch_binary  - The binary terminates every client TLS session, so a download that does not
-3416  mt_ensure_user
-3425  mt_write_config  - Masking is handled by telemt itself: unrecognised connections are fronted to
-3471  mt_write_service  - WorkingDirectory is the state directory because telemt writes its runtime
-3527  mt_service_status
-3550  mt_service_is_running
-3561  mt_verify_service_started  - telemt probes every Telegram data centre before it binds, which takes some
-3590  mt_firewall_add
-3599  mt_firewall_remove
-3609  mt_migrate_legacy
-3661  mt_legacy_zig_present  - The mtproto.zig backend shipped until v1.4.0.
-3669  mt_migrate_zig  - mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
-3732  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
-3755  mt_start_installed
-3761  mt_install
-3826  mt_remove
-3850  mt_restart_or_start_service
-3867  mt_stop
-3881  mt_update
-3925  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
-3957  mt_remove_user
-3983  mt_client_ips_raw
-3992  mt_client_ip_count
-3996  mt_show_active_ips
-4016  mt_show_logs
-4024  mt_show_status_link
-4045  mt_status_block
-4090  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
-4152  show_client_info
-4180  show_diagnostics
-4259  reissue_certificate
-4281  reapply_firewall
-4292  firewall_hardening_menu
-4385  start_vpn_service
-4390  stop_vpn_service
-4395  restart_vpn_menu
-4407  start_vpn_menu
-4419  stop_vpn_menu
-4430  show_recent_logs
-4438  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
-4467  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
-4474  vpn_users_menu
-4499  service_tools_menu
-4537  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
-4546  main_menu_not_installed
-4583  main_menu_installed
-4626  usage
-4647  state_check  - Non-interactive health report. Exits non-zero when something needs
-4690  main
+149  report_error  - Reports a failure to the operator and remembers it for the menu header.
+155  require_root
+162  ensure_manager_dir
+167  load_config
+211  migrate_config  - Config files written before schema 2 simply lack the newer keys; the
+218  effective_installed
+222  save_config
+260  os_supported
+272  supported_os_list
+277  os_label
+287  detect_service_name
+299  service_active
+304  restart_vpn_service
+313  detect_uplink_if
+317  detect_default_dns
+328  normalize_dns_list
+357  csv_list_contains
+365  append_missing_csv_items
+377  ensure_apple_esp_proposals
+382  conntrack_target_max
+391  conntrack_status
+414  dns_list_drop_ipv6  - Drop IPv6 resolvers from a comma-separated DNS list; they are unreachable
+424  valid_ipv4
+433  ip_to_int
+439  cidr_contains
+453  cidr_overlaps  - True when two IPv4 CIDRs share any address.
+466  conflicting_local_networks  - Networks already configured on this host that would collide with the pool.
+477  valid_ipv6
+507  valid_ipv6_cidr
+516  valid_ipv6_mode
+523  host_has_global_ipv6
+527  valid_cidr
+536  valid_range
+546  valid_port
+552  valid_port_list  - Comma/space separated TCP/UDP port list; empty input is valid (no ports).
+561  normalize_port_list  - Canonical form: comma-separated, duplicates removed, original order kept.
+573  valid_domain_name
+592  valid_dns_provider
+596  valid_username
+602  valid_group_name
+608  valid_platform
+615  valid_egress_policy
+622  valid_cert_key_type
+630  acme_keylength_for  - acme.sh spells key types differently from the config value.
+641  valid_ike_unique
+648  strongswan_version
+656  strongswan_at_least  - Compares the running strongSwan against major.minor.patch arguments.
+668  infer_group_from_username
+674  normalize_platform
+687  html_escape
+697  print_indented  - Prints a multi-line value indented, one line per row.
+705  trim
+712  new_uuid
+727  interface_exists
+731  detect_topology_hint
+744  count_users
+752  cert_public_key_alg
+757  cert_days_left
+767  cert_issuer_cn
+773  ca_chain_file_count
+782  has_nat_rule
+787  has_forward_rule_out
+792  has_forward_rule_in
+797  has_mss_clamp_rule
+801  has_isolation_rule
+805  has_harden_chain
+809  has_egress_chain
+813  has_host_chain
+819  ipt_del_rule  - Rule helpers used by the manager itself (the generated firewall script
+827  ipt_drop_chain
+835  status_line
+842  menu_item
+848  menu_enter_hint
+853  read_menu_choice
+864  acme_mode_from_choice
+874  select_acme_mode
+900  invalid_choice
+905  render_header
+981  pause
+986  ask
+1001  ask_secret  - Secrets must not end up in the terminal scrollback or in a recorded
+1008  ask_secret_multiline_generic
+1029  ask_acme_provider_env
+1053  backup_file
+1069  prune_backups  - Old certificates and private keys are liabilities; keep only the most
+1081  fetch_and_confirm_script  - Downloads a remote installer and refuses to run it unattended: the operator
+1107  write_certificate_reload_script
+1211  write_certificate_check_service  - acme.sh renews from cron with its output sent to /dev/null. A silent
+1280  ensure_packages  - Records which of the required packages were actually missing, so that
+1308  ensure_acme_installed
+1353  detect_ssh_ports  - Ports sshd actually listens on, resolved while the manager is running and
+1364  write_firewall_script
+1400  ipt_ins  - --------------------------------------------------------------------------
+1407  ipt_app
+1414  ipt_del
+1422  ipt_chain_reset
+1428  ipt_chain_drop
+1438  dns_servers_v4  - Client DNS servers of the matching family; they stay reachable even when
+1447  dns_servers_v6
+1685  write_firewall_service
+1705  apply_firewall_rules
+1715  remove_firewall_rules
+1774  forwarding_used_by_others  - Other software on the host may depend on forwarding (Docker, k8s, another
+1794  disable_sysctl
+1806  cleanup_acme_binding
+1815  cleanup_managed_files
+1834  purge_vpn_packages  - Only packages this manager installed are purged, and only the strongSwan
+1867  uninstall_cleanup
+1919  ensure_kernel_ipsec_support
+1962  enable_sysctl
+2007  generated_is_current  - True when a generated file carries the marker of the running version.
+2015  stale_artifacts  - Lists the managed artifacts that are missing or were written by an older
+2026  reconcile_managed_state  - Upgrading the script used to leave every generated artifact behind at its
+2053  escape_swanctl
+2060  generate_swanctl_conf
+2162  load_swanctl
+2168  reload_vpn_credentials
+2178  terminate_user_sas  - Best-effort: terminate IKE SAs whose identity matches the given username,
+2191  issue_and_install_cert
+2258  validate_acme_env
+2286  validate_install_inputs
+2423  install_wizard
+2612  random_password
+2616  ensure_users_db
+2623  migrate_users_db
+2650  add_or_update_user
+2727  list_users_menu
+2749  remove_user_menu
+2809  get_group_users
+2826  list_groups  - The group is the explicit third field; only when it is missing is it
+2839  select_group_prompt
+2892  make_ios_mobileconfig
+2938  make_ubuntu_script
+3009  credentials_html_for_platform
+3017  windows_message_file
+3051  ios_message_file
+3068  ubuntu_message_file
+3083  generate_client_bundle_local
+3186  mt_is_installed
+3190  mt_require_installed
+3198  mt_load_config
+3224  mt_user_secret  - Secret of a named proxy user, or of the first one when no name is given.
+3245  mt_list_users
+3261  mt_users_block  - Current users as TOML assignments, so a config rewrite keeps every secret
+3271  mt_valid_user_name
+3276  mt_random_secret  - Proxy secrets are 32 hex characters and are embedded verbatim in the link.
+3284  mt_validate_port
+3291  mt_port_in_use
+3296  mt_get_server_ip
+3324  mt_public_host  - The host clients dial. A public name survives NAT and a provider changing
+3332  mt_build_link
+3360  mt_release_asset  - telemt publishes static musl builds, so the binary does not depend on the
+3368  mt_latest_version
+3373  mt_installed_version
+3380  mt_fetch_binary  - The binary terminates every client TLS session, so a download that does not
+3423  mt_ensure_user
+3432  mt_write_config  - Masking is handled by telemt itself: unrecognised connections are fronted to
+3480  mt_write_service  - WorkingDirectory is the state directory because telemt writes its runtime
+3536  mt_service_status
+3559  mt_service_is_running
+3570  mt_verify_service_started  - telemt probes every Telegram data centre before it binds, which takes some
+3599  mt_firewall_add
+3608  mt_firewall_remove
+3618  mt_migrate_legacy
+3670  mt_legacy_zig_present  - The mtproto.zig backend shipped until v1.4.0.
+3678  mt_migrate_zig  - mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
+3751  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
+3774  mt_start_installed
+3780  mt_install
+3845  mt_remove
+3869  mt_restart_or_start_service
+3886  mt_stop
+3900  mt_update
+3944  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
+3976  mt_remove_user
+4002  mt_client_ips_raw
+4011  mt_client_ip_count
+4015  mt_show_active_ips
+4035  mt_show_logs
+4043  mt_show_status_link
+4064  mt_status_block
+4109  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
+4171  show_client_info
+4199  show_diagnostics
+4278  reissue_certificate
+4300  reapply_firewall
+4311  firewall_hardening_menu
+4404  start_vpn_service
+4409  stop_vpn_service
+4414  restart_vpn_menu
+4426  start_vpn_menu
+4438  stop_vpn_menu
+4449  show_recent_logs
+4457  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
+4486  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
+4493  vpn_users_menu
+4518  service_tools_menu
+4556  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
+4565  main_menu_not_installed
+4602  main_menu_installed
+4645  usage
+4666  state_check  - Non-interactive health report. Exits non-zero when something needs
+4709  main
