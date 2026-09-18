@@ -3490,8 +3490,14 @@ use_middle_proxy = false
 log_level = "normal"
 
 [general.modes]
+# classic is obsolete. secure (the dd prefix) is more recognisable to DPI than
+# tls, but the backend this replaced accepted it and some clients still hold dd
+# links: with it off, those clients timed out on every attempt and were served
+# nothing, while ee clients were unaffected. Measured on a live server, 33
+# handshake timeouts in 77 connections became 0 in 134. The links this manager
+# hands out are ee.
 classic = false
-secure = false
+secure = true
 tls = true
 
 [general.links]
