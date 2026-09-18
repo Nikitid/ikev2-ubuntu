@@ -11,7 +11,7 @@ Each entry is `line  name  - purpose`, where the purpose is the first line of
 the comment above the function. Files under 300 lines are omitted: reading
 those whole is cheap enough.
 
-## scripts/ikev2-manager.sh - 4835 lines
+## scripts/ikev2-manager.sh - 4841 lines
 
 157  report_error  - Reports a failure to the operator and remembers it for the menu header.
 163  require_root
@@ -172,49 +172,49 @@ those whole is cheap enough.
 3428  mt_fetch_binary  - The binary terminates every client TLS session, so a download that does not
 3471  mt_ensure_user
 3480  mt_write_config  - Masking is handled by telemt itself: unrecognised connections are fronted to
-3535  mt_write_service  - WorkingDirectory is the state directory because telemt writes its runtime
-3591  mt_service_status
-3614  mt_service_is_running
-3625  mt_verify_service_started  - telemt probes every Telegram data centre before it binds, which takes some
-3654  mt_firewall_add
-3663  mt_firewall_remove
-3673  mt_migrate_legacy
-3725  mt_legacy_zig_present  - The mtproto.zig backend shipped until v1.4.0.
-3733  mt_migrate_zig  - mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
-3806  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
-3829  mt_start_installed
-3835  mt_install
-3900  mt_remove
-3924  mt_restart_or_start_service
-3941  mt_stop
-3955  mt_update
-3999  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
-4031  mt_remove_user
-4057  mt_client_ips_raw
-4066  mt_client_ip_count
-4070  mt_show_active_ips
-4090  mt_show_logs
-4098  mt_show_status_link
-4123  mt_status_block
-4168  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
-4230  show_client_info
-4258  show_diagnostics
-4337  reissue_certificate
-4359  reapply_firewall
-4370  firewall_hardening_menu
-4463  start_vpn_service
-4468  stop_vpn_service
-4473  restart_vpn_menu
-4485  start_vpn_menu
-4497  stop_vpn_menu
-4508  show_recent_logs
-4516  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
-4545  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
-4552  vpn_users_menu
-4577  service_tools_menu
-4615  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
-4624  main_menu_not_installed
-4661  main_menu_installed
-4704  usage
-4725  state_check  - Non-interactive health report. Exits non-zero when something needs
-4768  main
+3541  mt_write_service  - WorkingDirectory is the state directory because telemt writes its runtime
+3597  mt_service_status
+3620  mt_service_is_running
+3631  mt_verify_service_started  - telemt probes every Telegram data centre before it binds, which takes some
+3660  mt_firewall_add
+3669  mt_firewall_remove
+3679  mt_migrate_legacy
+3731  mt_legacy_zig_present  - The mtproto.zig backend shipped until v1.4.0.
+3739  mt_migrate_zig  - mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
+3812  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
+3835  mt_start_installed
+3841  mt_install
+3906  mt_remove
+3930  mt_restart_or_start_service
+3947  mt_stop
+3961  mt_update
+4005  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
+4037  mt_remove_user
+4063  mt_client_ips_raw
+4072  mt_client_ip_count
+4076  mt_show_active_ips
+4096  mt_show_logs
+4104  mt_show_status_link
+4129  mt_status_block
+4174  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
+4236  show_client_info
+4264  show_diagnostics
+4343  reissue_certificate
+4365  reapply_firewall
+4376  firewall_hardening_menu
+4469  start_vpn_service
+4474  stop_vpn_service
+4479  restart_vpn_menu
+4491  start_vpn_menu
+4503  stop_vpn_menu
+4514  show_recent_logs
+4522  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
+4551  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
+4558  vpn_users_menu
+4583  service_tools_menu
+4621  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
+4630  main_menu_not_installed
+4667  main_menu_installed
+4710  usage
+4731  state_check  - Non-interactive health report. Exits non-zero when something needs
+4774  main
