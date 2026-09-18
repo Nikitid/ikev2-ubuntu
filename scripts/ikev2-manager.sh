@@ -3700,8 +3700,12 @@ mt_migrate_zig() {
   fi
 
   systemctl disable --now "${MT_LEGACY_SERVICE}.service" >/dev/null 2>&1 || true
+  # The masking health check is a timer and a service: leaving the timer
+  # behind leaves a failed unit that outlives the backend it watched.
+  systemctl disable --now mtproto-mask-health.timer >/dev/null 2>&1 || true
   systemctl disable --now mtproto-mask-health.service >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${MT_LEGACY_SERVICE}.service"
+  rm -f /etc/systemd/system/mtproto-mask-health.timer
   rm -f /etc/systemd/system/mtproto-mask-health.service
   rm -rf "/etc/systemd/system/${MT_LEGACY_SERVICE}.service.d"
   rm -rf "$MT_LEGACY_DIR"

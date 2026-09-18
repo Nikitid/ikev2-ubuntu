@@ -11,7 +11,7 @@ Each entry is `line  name  - purpose`, where the purpose is the first line of
 the comment above the function. Files under 300 lines are omitted: reading
 those whole is cheap enough.
 
-## scripts/ikev2-manager.sh - 4753 lines
+## scripts/ikev2-manager.sh - 4757 lines
 
 142  report_error  - Reports a failure to the operator and remembers it for the menu header.
 148  require_root
@@ -179,40 +179,40 @@ those whole is cheap enough.
 3609  mt_migrate_legacy
 3661  mt_legacy_zig_present  - The mtproto.zig backend shipped until v1.4.0.
 3669  mt_migrate_zig  - mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
-3728  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
-3751  mt_start_installed
-3757  mt_install
-3822  mt_remove
-3846  mt_restart_or_start_service
-3863  mt_stop
-3877  mt_update
-3921  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
-3953  mt_remove_user
-3979  mt_client_ips_raw
-3988  mt_client_ip_count
-3992  mt_show_active_ips
-4012  mt_show_logs
-4020  mt_show_status_link
-4041  mt_status_block
-4086  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
-4148  show_client_info
-4176  show_diagnostics
-4255  reissue_certificate
-4277  reapply_firewall
-4288  firewall_hardening_menu
-4381  start_vpn_service
-4386  stop_vpn_service
-4391  restart_vpn_menu
-4403  start_vpn_menu
-4415  stop_vpn_menu
-4426  show_recent_logs
-4434  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
-4463  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
-4470  vpn_users_menu
-4495  service_tools_menu
-4533  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
-4542  main_menu_not_installed
-4579  main_menu_installed
-4622  usage
-4643  state_check  - Non-interactive health report. Exits non-zero when something needs
-4686  main
+3732  mt_install_runtime  - Shared by a fresh install and a migration: binary, config, unit, firewall.
+3755  mt_start_installed
+3761  mt_install
+3826  mt_remove
+3850  mt_restart_or_start_service
+3867  mt_stop
+3881  mt_update
+3925  mt_add_user  - telemt watches its config file and reloads user changes on its own, so a
+3957  mt_remove_user
+3983  mt_client_ips_raw
+3992  mt_client_ip_count
+3996  mt_show_active_ips
+4016  mt_show_logs
+4024  mt_show_status_link
+4045  mt_status_block
+4090  mtproxy_menu  - Menu keys stay in the same place regardless of service state: an entry
+4152  show_client_info
+4180  show_diagnostics
+4259  reissue_certificate
+4281  reapply_firewall
+4292  firewall_hardening_menu
+4385  start_vpn_service
+4390  stop_vpn_service
+4395  restart_vpn_menu
+4407  start_vpn_menu
+4419  stop_vpn_menu
+4430  show_recent_logs
+4438  show_active_sessions  - Who is connected right now. The manager could terminate a user's sessions
+4467  failed_auth_count  - Counts rejected EAP attempts in the journal; a spike means someone is
+4474  vpn_users_menu
+4499  service_tools_menu
+4537  has_leftovers  - Anything this manager owns that is still on disk after a failed or partial
+4546  main_menu_not_installed
+4583  main_menu_installed
+4626  usage
+4647  state_check  - Non-interactive health report. Exits non-zero when something needs
+4690  main
