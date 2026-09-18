@@ -9,7 +9,7 @@ LTS releases. Keep changes compatible with the existing single-script design.
 
 - Read `docs/MAP.md` first. Locate a function with
   `grep -n <name> docs/INDEX.md` rather than reading the manager script whole:
-  it is 4399 lines.
+  it is 4753 lines.
 - Run `git status -sb` and preserve unrelated changes.
 
 ## Structure
