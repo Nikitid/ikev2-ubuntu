@@ -40,6 +40,13 @@ MT_DEFAULT_TLS_DOMAIN="rutube.ru"
 # Concurrent client connections. telemt clamps this to what the host's memory
 # can carry and says so in the log.
 MT_MAX_CONNECTIONS="512"
+# Handshake fragmentation: the FakeTLS ServerHello is sent in segments this
+# small so a DPI box cannot read it in one packet. It applies to the handshake
+# only; MT_CLIENT_MSS_BULK carries the rest of the connection. Clamping the
+# whole connection instead (an iptables TCPMSS rule) multiplies every packet
+# count by ceil(1460/mss) and is what made mobile clients time out.
+MT_CLIENT_MSS="tspu"
+MT_CLIENT_MSS_BULK="1400"
 MT_RELEASE_API="https://api.github.com/repos/telemt/telemt/releases/latest"
 MT_RELEASE_BASE="https://github.com/telemt/telemt/releases/download"
 # The mtproto.zig installation shipped until v1.4.0, migrated on first run.
@@ -3447,6 +3454,8 @@ public_port = ${port}
 [server]
 port = ${port}
 max_connections = ${MT_MAX_CONNECTIONS}
+client_mss = "${MT_CLIENT_MSS}"
+client_mss_bulk = "${MT_CLIENT_MSS_BULK}"
 
 [server.api]
 enabled = false
@@ -3704,6 +3713,16 @@ mt_migrate_zig() {
   # behind leaves a failed unit that outlives the backend it watched.
   systemctl disable --now mtproto-mask-health.timer >/dev/null 2>&1 || true
   systemctl disable --now mtproto-mask-health.service >/dev/null 2>&1 || true
+  # The old stack clamped MSS for the whole connection to fragment the
+  # handshake. telemt does that for the handshake alone, so the clamp only
+  # costs packets now.
+  systemctl disable --now mtproto-tcpmss.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/mtproto-tcpmss.service
+  # The old stack also desynced outgoing packets with nfqws. Against telemt
+  # that corrupts the FakeTLS response instead of hiding it: measured on a
+  # live server, it left nine of ten client connections stuck before they
+  # reached Telegram. Disabled, not uninstalled — zapret itself is untouched.
+  systemctl disable --now nfqws-mtproto.service >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${MT_LEGACY_SERVICE}.service"
   rm -f /etc/systemd/system/mtproto-mask-health.timer
   rm -f /etc/systemd/system/mtproto-mask-health.service
