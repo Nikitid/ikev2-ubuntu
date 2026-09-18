@@ -47,6 +47,14 @@ MT_MAX_CONNECTIONS="512"
 # count by ceil(1460/mss) and is what made mobile clients time out.
 MT_CLIENT_MSS="tspu"
 MT_CLIENT_MSS_BULK="1400"
+# Extra fronting domains. Each one produces its own link for the same secret,
+# so a domain that gets flagged can be handed out instead of the primary
+# without reinstalling and without changing anyone's secret.
+MT_TLS_DOMAINS_EXTRA="ok.ru"
+# Loopback-only management surface. telemt logs failures and not successes,
+# so without these the only health signal is counting sockets.
+MT_API_LISTEN="127.0.0.1:9091"
+MT_METRICS_LISTEN="127.0.0.1:9090"
 MT_RELEASE_API="https://api.github.com/repos/telemt/telemt/releases/latest"
 MT_RELEASE_BASE="https://github.com/telemt/telemt/releases/download"
 # The mtproto.zig installation shipped until v1.4.0, migrated on first run.
@@ -3268,6 +3276,45 @@ mt_users_block() {
   done < <(mt_list_users)
 }
 
+# TOML array of the extra fronting domains, for the generated config.
+mt_tls_domains_array() {
+  local d out=""
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    if [[ -n "$out" ]]; then
+      out+=", "
+    fi
+    out+="\"${d}\""
+  done < <(printf '%s\n' "$MT_TLS_DOMAINS_EXTRA" | tr ',' '\n' | tr -d ' ')
+  printf '[%s]' "$out"
+}
+
+# Every domain the proxy fronts, primary first. One secret, one link per
+# domain: handing out a different domain does not revoke anything.
+mt_tls_domains() {
+  [[ -f "$MT_CONFIG_FILE" ]] || return 0
+  awk '
+    /^\[censorship\]/ { in_c = 1; next }
+    /^\[/ { in_c = 0 }
+    in_c && /^[[:space:]]*tls_domain[[:space:]]*=/ {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*"/, "", v)
+      sub(/".*$/, "", v)
+      if (v != "" && !(v in seen)) { seen[v] = 1; print v }
+    }
+    in_c && /^[[:space:]]*tls_domains[[:space:]]*=/ {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*\[/, "", v)
+      sub(/\].*$/, "", v)
+      n = split(v, parts, ",")
+      for (i = 1; i <= n; i++) {
+        gsub(/[[:space:]"]/, "", parts[i])
+        if (parts[i] != "" && !(parts[i] in seen)) { seen[parts[i]] = 1; print parts[i] }
+      }
+    }
+  ' "$MT_CONFIG_FILE" 2>/dev/null || true
+}
+
 mt_valid_user_name() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]
 }
@@ -3330,9 +3377,10 @@ mt_public_host() {
 }
 
 mt_build_link() {
-  local user="${1:-}"
+  local user="${1:-}" domain="${2:-}"
   mt_load_config
   local host domain_hex secret
+  [[ -n "$domain" ]] || domain="$MT_TLS_DOMAIN"
 
   if ! command -v xxd >/dev/null 2>&1; then
     echo "link unavailable: xxd is not installed"
@@ -3350,7 +3398,7 @@ mt_build_link() {
     return 1
   fi
 
-  domain_hex="$(printf '%s' "$MT_TLS_DOMAIN" | xxd -ps -c 999 | tr -d '\n')"
+  domain_hex="$(printf '%s' "$domain" | xxd -ps -c 999 | tr -d '\n')"
   printf 'tg://proxy?server=%s&port=%s&secret=ee%s%s\n' \
     "$host" "$MT_PORT" "$secret" "$domain_hex"
 }
@@ -3456,12 +3504,19 @@ port = ${port}
 max_connections = ${MT_MAX_CONNECTIONS}
 client_mss = "${MT_CLIENT_MSS}"
 client_mss_bulk = "${MT_CLIENT_MSS_BULK}"
+metrics_listen = "${MT_METRICS_LISTEN}"
 
 [server.api]
-enabled = false
+enabled = true
+listen = "${MT_API_LISTEN}"
+whitelist = ["127.0.0.1/32", "::1/128"]
 
 [censorship]
 tls_domain = "${domain}"
+tls_domains = $(mt_tls_domains_array)
+# A real web server answers an unexpected SNI; dropping it is itself a signal,
+# so unknown names are fronted to the masking host like everything else.
+unknown_sni_action = "mask"
 mask = true
 tls_emulation = true
 tls_front_dir = "${MT_STATE_DIR}/tlsfront"
@@ -4046,15 +4101,19 @@ mt_show_status_link() {
   echo -e "${YELLOW}MTProto proxy status:${NC} $(mt_service_status)"
   echo -e "${YELLOW}Version:${NC} $(mt_installed_version)"
   echo -e "${YELLOW}Port:${NC} ${MT_PORT}"
-  echo -e "${YELLOW}TLS domain:${NC} ${MT_TLS_DOMAIN} (permanent)"
+  echo -e "${YELLOW}TLS domains:${NC} $(mt_tls_domains | tr '\n' ' ')"
   echo -e "${YELLOW}Active IPs:${NC} $(mt_client_ip_count 2>/dev/null || echo 0)"
   echo
 
-  local user found=0
+  local user domain found=0
   while IFS= read -r user; do
     [[ -n "$user" ]] || continue
     found=1
-    echo -e "${YELLOW}${user}:${NC} $(mt_build_link "$user" 2>/dev/null || true)"
+    echo -e "${YELLOW}${user}:${NC}"
+    while IFS= read -r domain; do
+      [[ -n "$domain" ]] || continue
+      echo "  ${domain}: $(mt_build_link "$user" "$domain" 2>/dev/null || true)"
+    done < <(mt_tls_domains)
   done < <(mt_list_users)
   ((found)) || echo "No proxy users configured."
   echo
