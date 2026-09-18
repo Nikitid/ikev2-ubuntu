@@ -12,7 +12,7 @@ ACME certificates, EAP-MSCHAPv2 users, and firewall rules.
 ## Status
 
 Ubuntu 22.04, 24.04 and 26.04 LTS are supported. The current stable release
-is `v1.4.0`.
+is `v1.5.0`.
 
 ## Features
 
@@ -26,7 +26,8 @@ is `v1.4.0`.
 - diagnostics, logs, active sessions, service control, and certificate
   renewal;
 - daily certificate expiry check reported to the journal;
-- optional MTProto proxy management ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT).
+- optional MTProto proxy management ([telemt](https://github.com/telemt/telemt),
+  TELEMT Public License).
 
 ## Requirements
 
@@ -40,7 +41,7 @@ is `v1.4.0`.
 Pinned stable release:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.4.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.5.0/scripts/ikev2-manager.sh)
 ```
 
 Current `main` branch:

@@ -13,7 +13,7 @@
 ## Состояние
 
 Поддерживаются Ubuntu 22.04, 24.04 и 26.04 LTS. Актуальная стабильная
-версия — `v1.4.0`.
+версия — `v1.5.0`.
 
 ## Возможности
 
@@ -27,7 +27,8 @@
 - диагностика, журналы, активные сессии, управление службами и обновление
   сертификатов;
 - ежедневная проверка срока действия сертификата с записью в журнал;
-- дополнительное управление MTProto-прокси ([mtproto.zig](https://github.com/sleep3r/mtproto.zig) by Aleksandr Kalashnikov, MIT).
+- дополнительное управление MTProto-прокси ([telemt](https://github.com/telemt/telemt),
+  TELEMT Public License).
 
 ## Требования
 
@@ -41,7 +42,7 @@
 Стабильный релиз:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.4.0/scripts/ikev2-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Nikitid/ikev2-ubuntu/v1.5.0/scripts/ikev2-manager.sh)
 ```
 
 Текущая ветка `main`:

@@ -4,7 +4,7 @@ set -Euo pipefail
 # which corrupts replacements like &lt; in html_escape.
 shopt -u patsub_replacement 2>/dev/null || true
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 # Schema version of $CONFIG_FILE; migrate_config() upgrades older files.
 CONFIG_VERSION="2"
 # Marker written into every generated file so a newer script can detect and
@@ -25,19 +25,27 @@ MODULES_LOAD_FILE="/etc/modules-load.d/ikev2-manager.conf"
 BACKUP_KEEP="5"
 
 # MTProto proxy manager paths
-# Backend: mtproto.zig by Aleksandr Kalashnikov (sleep3r)
-# Source:  https://github.com/sleep3r/mtproto.zig  License: MIT
-MT_SERVICE="mtproto-proxy"
-MT_BUDDY_BIN="/usr/local/bin/mtbuddy"
-MT_INSTALL_DIR="/opt/mtproto-proxy"
+# Backend: telemt  https://github.com/telemt/telemt
+# License: TELEMT Public License, see THIRD_PARTY_LICENSES.md
+MT_SERVICE="telemt"
+MT_INSTALL_DIR="/opt/telemt"
+MT_BIN="${MT_INSTALL_DIR}/telemt"
 MT_CONFIG_FILE="${MT_INSTALL_DIR}/config.toml"
 MT_SERVICE_FILE="/etc/systemd/system/${MT_SERVICE}.service"
+# Written by the unit's StateDirectory; holds the TLS fronting cache.
+MT_STATE_DIR="/var/lib/telemt"
+MT_RUN_USER="telemt"
 MT_DEFAULT_PORT="443"
 MT_DEFAULT_TLS_DOMAIN="rutube.ru"
-MT_BOOTSTRAP_URL="https://raw.githubusercontent.com/sleep3r/mtproto.zig/main/deploy/bootstrap.sh"
-# Optional pin: set to the expected sha256 of the bootstrap script to install
-# without the interactive fingerprint confirmation.
-MT_BOOTSTRAP_SHA256=""
+# Concurrent client connections. telemt clamps this to what the host's memory
+# can carry and says so in the log.
+MT_MAX_CONNECTIONS="512"
+MT_RELEASE_API="https://api.github.com/repos/telemt/telemt/releases/latest"
+MT_RELEASE_BASE="https://github.com/telemt/telemt/releases/download"
+# The mtproto.zig installation shipped until v1.4.0, migrated on first run.
+MT_LEGACY_SERVICE="mtproto-proxy"
+MT_LEGACY_DIR="/opt/mtproto-proxy"
+MT_LEGACY_BUDDY_BIN="/usr/local/bin/mtbuddy"
 
 SWANCTL_CONF="/etc/swanctl/swanctl.conf"
 SWANCTL_X509_DIR="/etc/swanctl/x509"
@@ -3158,18 +3166,18 @@ EOF_WINPS
 }
 
 # ------------------------- MTProto proxy manager -------------------------
-# Backend: mtproto.zig — a lightweight Telegram proxy in Zig with FakeTLS.
-# Source:  https://github.com/sleep3r/mtproto.zig
-# Author:  Aleksandr Kalashnikov (sleep3r)
-# License: MIT — copyright notice preserved in THIRD_PARTY_LICENSES.md.
+# Backend: telemt — a Telegram MTProto proxy in Rust with FakeTLS fronting.
+# Source:  https://github.com/telemt/telemt
+# License: TELEMT Public License — terms preserved in THIRD_PARTY_LICENSES.md.
 #
-# The proxy is installed and managed via the mtbuddy CLI downloaded from the
-# project's GitHub releases. The TLS impersonation domain (tls_domain) is
-# permanent after installation; changing it requires a full reinstall and
-# invalidates all distributed tg:// links.
+# The release binary is installed from the project's GitHub releases and
+# verified against the published sha256; the config and the unit are written
+# by this manager, so masking needs no separate web server. The TLS
+# impersonation domain (tls_domain) is permanent after installation; changing
+# it requires a full reinstall and invalidates all distributed tg:// links.
 
 mt_is_installed() {
-  [[ -x "$MT_BUDDY_BIN" && -d "$MT_INSTALL_DIR" && -f "$MT_SERVICE_FILE" ]]
+  [[ -x "$MT_BIN" && -f "$MT_CONFIG_FILE" && -f "$MT_SERVICE_FILE" ]]
 }
 
 mt_require_installed() {
@@ -3241,6 +3249,31 @@ mt_list_users() {
   ' "$MT_CONFIG_FILE" 2>/dev/null || true
 }
 
+# Current users as TOML assignments, so a config rewrite keeps every secret
+# and therefore every link that was handed out.
+mt_users_block() {
+  local user secret
+  while IFS= read -r user; do
+    [[ -n "$user" ]] || continue
+    secret="$(mt_user_secret "$user")"
+    [[ -n "$secret" ]] || continue
+    printf '%s = "%s"\n' "$user" "$secret"
+  done < <(mt_list_users)
+}
+
+mt_valid_user_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]
+}
+
+# Proxy secrets are 32 hex characters and are embedded verbatim in the link.
+mt_random_secret() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 16
+    return 0
+  fi
+  head -c 16 /dev/urandom | xxd -ps -c 999 | tr -d '\n'
+}
+
 mt_validate_port() {
   local port="$1"
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
@@ -3259,24 +3292,34 @@ mt_get_server_ip() {
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{
     for (i = 1; i <= NF; i++) {
       if ($i == "src") {
-        print $(i+1)
+        print $(i + 1)
         exit
       }
     }
   }')"
 
-  if [[ -n "$ip" ]]; then
-    printf '%s\n' "$ip"
+  if [[ -n "$ip" ]] && valid_ipv4 "$ip"; then
+    echo "$ip"
     return 0
   fi
 
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  if [[ -n "$ip" ]]; then
-    printf '%s\n' "$ip"
+  ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  if [[ -n "$ip" ]] && valid_ipv4 "$ip"; then
+    echo "$ip"
     return 0
   fi
 
   return 1
+}
+
+# The host clients dial. A public name survives NAT and a provider changing
+# the address; the detected source address does not.
+mt_public_host() {
+  local host="${DOMAIN:-}"
+  if [[ -z "$host" ]]; then
+    host="$(mt_get_server_ip 2>/dev/null || true)"
+  fi
+  echo "${host:-YOUR_IP}"
 }
 
 mt_build_link() {
@@ -3289,12 +3332,7 @@ mt_build_link() {
     return 1
   fi
 
-  # A public hostname survives NAT; the detected source address does not.
-  host="${DOMAIN:-}"
-  if [[ -z "$host" ]]; then
-    host="$(mt_get_server_ip 2>/dev/null || true)"
-    host="${host:-YOUR_IP}"
-  fi
+  host="$(mt_public_host)"
 
   secret="$MT_SECRET"
   if [[ -n "$user" ]]; then
@@ -3308,6 +3346,182 @@ mt_build_link() {
   domain_hex="$(printf '%s' "$MT_TLS_DOMAIN" | xxd -ps -c 999 | tr -d '\n')"
   printf 'tg://proxy?server=%s&port=%s&secret=ee%s%s\n' \
     "$host" "$MT_PORT" "$secret" "$domain_hex"
+}
+
+# telemt publishes static musl builds, so the binary does not depend on the
+# glibc of the running release.
+mt_release_asset() {
+  case "$(uname -m)" in
+    x86_64) echo "telemt-x86_64-linux-musl.tar.gz" ;;
+    aarch64 | arm64) echo "telemt-aarch64-linux-musl.tar.gz" ;;
+    *) return 1 ;;
+  esac
+}
+
+mt_latest_version() {
+  curl -fsSL --max-time 20 "$MT_RELEASE_API" 2>/dev/null \
+    | awk -F'"' '/"tag_name"/ {print $4; exit}'
+}
+
+mt_installed_version() {
+  [[ -x "$MT_BIN" ]] || return 0
+  "$MT_BIN" --version 2>/dev/null | awk '{print $NF; exit}'
+}
+
+# The binary terminates every client TLS session, so a download that does not
+# match the published checksum is discarded rather than installed.
+mt_fetch_binary() {
+  local version="$1"
+  local asset url tmp expected actual
+
+  if ! asset="$(mt_release_asset)"; then
+    echo -e "${RED}Unsupported architecture: $(uname -m)${NC}"
+    return 1
+  fi
+
+  url="${MT_RELEASE_BASE}/${version}/${asset}"
+  tmp="$(mktemp -d /tmp/telemt.XXXXXX)"
+
+  if ! curl -fsSL --max-time 180 -o "${tmp}/${asset}" "$url"; then
+    echo -e "${RED}Download failed: ${url}${NC}"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  if ! curl -fsSL --max-time 30 -o "${tmp}/${asset}.sha256" "${url}.sha256"; then
+    echo -e "${RED}No checksum published for ${version}${NC}"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  expected="$(awk '{print $1; exit}' "${tmp}/${asset}.sha256")"
+  actual="$(sha256sum "${tmp}/${asset}" | awk '{print $1}')"
+  if [[ -z "$expected" || "$expected" != "$actual" ]]; then
+    echo -e "${RED}Checksum mismatch for ${asset}; nothing was installed${NC}"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  if ! tar -xzf "${tmp}/${asset}" -C "$tmp" || [[ ! -f "${tmp}/telemt" ]]; then
+    echo -e "${RED}Release archive does not contain the telemt binary${NC}"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  install -d -o root -g root -m 0755 "$MT_INSTALL_DIR"
+  install -o root -g root -m 0755 "${tmp}/telemt" "$MT_BIN"
+  rm -rf "$tmp"
+}
+
+mt_ensure_user() {
+  if ! id "$MT_RUN_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$MT_RUN_USER"
+  fi
+}
+
+# Masking is handled by telemt itself: unrecognised connections are fronted to
+# the real tls_domain, which answers with its own certificate. The generated
+# marker lets an upgrade recognise a config written by an older version.
+mt_write_config() {
+  local port="$1" domain="$2" public_host="$3" users_block="$4"
+
+  install -d -o root -g root -m 0755 "$MT_INSTALL_DIR"
+  (
+    umask 077
+    cat >"$MT_CONFIG_FILE" <<EOF
+# $GENERATED_TAG v${SCRIPT_VERSION}
+[general]
+use_middle_proxy = false
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+public_host = "${public_host}"
+public_port = ${port}
+
+[server]
+port = ${port}
+max_connections = ${MT_MAX_CONNECTIONS}
+
+[server.api]
+enabled = false
+
+[censorship]
+tls_domain = "${domain}"
+mask = true
+tls_emulation = true
+tls_front_dir = "${MT_STATE_DIR}/tlsfront"
+
+[access.users]
+${users_block}
+EOF
+  )
+  chown "${MT_RUN_USER}:${MT_RUN_USER}" "$MT_CONFIG_FILE"
+  chmod 0640 "$MT_CONFIG_FILE"
+}
+
+# WorkingDirectory is the state directory because telemt writes its runtime
+# snapshot next to the working directory, which ProtectSystem=strict makes
+# read-only everywhere else.
+mt_write_service() {
+  cat >"$MT_SERVICE_FILE" <<EOF
+# $GENERATED_TAG v${SCRIPT_VERSION}
+[Unit]
+Description=Telemt MTProto Proxy
+Documentation=https://github.com/telemt/telemt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${MT_RUN_USER}
+Group=${MT_RUN_USER}
+WorkingDirectory=${MT_STATE_DIR}
+StateDirectory=telemt
+ExecStart=${MT_BIN} ${MT_CONFIG_FILE}
+KillSignal=SIGTERM
+TimeoutStopSec=25
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=${MT_INSTALL_DIR}
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+RemoveIPC=yes
+UMask=0077
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 "$MT_SERVICE_FILE"
+  systemctl daemon-reload
 }
 
 mt_service_status() {
@@ -3342,22 +3556,23 @@ mt_service_is_running() {
   [[ "$active_state" == "active" && "$sub_state" == "running" ]]
 }
 
+# telemt probes every Telegram data centre before it binds, which takes some
+# seconds; the socket, not the unit state, is what tells clients are served.
 mt_verify_service_started() {
-  local attempts=15 stable=0 active_state sub_state
+  local attempts=45 active_state sub_state
+
+  mt_load_config
 
   while ((attempts > 0)); do
     active_state="$(systemctl show -p ActiveState --value "${MT_SERVICE}.service" 2>/dev/null || true)"
     sub_state="$(systemctl show -p SubState --value "${MT_SERVICE}.service" 2>/dev/null || true)"
 
-    if [[ "$active_state" == "active" && "$sub_state" == "running" ]]; then
-      stable=$((stable + 1))
-      if ((stable >= 3)); then
-        return 0
-      fi
-    elif [[ "$active_state" == "failed" || "$sub_state" == "failed" ]]; then
+    if [[ "$active_state" == "failed" || "$sub_state" == "failed" ]]; then
       break
-    else
-      stable=0
+    fi
+
+    if [[ "$active_state" == "active" ]] && mt_port_in_use "$MT_PORT"; then
+      return 0
     fi
 
     sleep 1
@@ -3374,8 +3589,11 @@ mt_verify_service_started() {
 
 mt_firewall_add() {
   mt_load_config
-  iptables -C INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT 2>/dev/null \
-    || iptables -I INPUT -p tcp --dport "$MT_PORT" -m comment --comment "mtproto-manager" -j ACCEPT
+  if ! iptables -C INPUT -p tcp --dport "$MT_PORT" \
+    -m comment --comment "mtproto-manager" -j ACCEPT 2>/dev/null; then
+    iptables -I INPUT -p tcp --dport "$MT_PORT" \
+      -m comment --comment "mtproto-manager" -j ACCEPT
+  fi
 }
 
 mt_firewall_remove() {
@@ -3439,25 +3657,114 @@ mt_migrate_legacy() {
   rm -rf /etc/mtproxy-manager
 }
 
-mt_client_ips_raw() {
-  mt_load_config
-  # Peer column is "1.2.3.4:443" or "[2a00::1]:443"; strip port and brackets.
-  ss -Htn state established "( sport = :${MT_PORT} )" 2>/dev/null \
-    | awk '{print $4}' \
-    | sed -E 's/^\[//; s/\]?:[0-9]+$//' \
-    | sed '/^$/d'
+# The mtproto.zig backend shipped until v1.4.0.
+mt_legacy_zig_present() {
+  [[ -f "${MT_LEGACY_DIR}/config.toml" ||
+    -f "/etc/systemd/system/${MT_LEGACY_SERVICE}.service" ]]
 }
 
-mt_client_ip_count() {
-  mt_client_ips_raw | sort -u | wc -l
+# mtproto.zig and telemt read the same [server]/[censorship]/[access.users]
+# layout, so the port, the TLS domain and every user secret carry over and the
+# tg:// links handed out earlier keep working unchanged.
+mt_migrate_zig() {
+  local ans saved users_block port domain
+
+  render_header
+  echo -e "${CYAN}An mtproto.zig installation was found.${NC}"
+  echo
+
+  saved="$MT_CONFIG_FILE"
+  MT_CONFIG_FILE="${MT_LEGACY_DIR}/config.toml"
+  mt_load_config
+  users_block="$(mt_users_block)"
+  port="$MT_PORT"
+  domain="$MT_TLS_DOMAIN"
+  MT_CONFIG_FILE="$saved"
+
+  if [[ -z "$users_block" ]]; then
+    echo -e "${RED}No proxy users found in the old config; migration aborted${NC}"
+    sleep 2
+    return 1
+  fi
+
+  echo "Port ${port}, TLS domain ${domain}, $(printf '%s\n' "$users_block" | grep -c .) user(s)."
+  echo "The secrets are reused, so every existing tg:// link keeps working."
+  echo "Clients reconnect on their own; the proxy is unreachable for a few"
+  echo "seconds while telemt probes the Telegram data centres."
+  echo
+  read -r -p "Migrate to telemt now? [y/N]: " ans || true
+  [[ "$ans" =~ ^[Yy]$ ]] || return 0
+
+  if ! mt_install_runtime "$port" "$domain" "$users_block"; then
+    return 1
+  fi
+
+  systemctl disable --now "${MT_LEGACY_SERVICE}.service" >/dev/null 2>&1 || true
+  systemctl disable --now mtproto-mask-health.service >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${MT_LEGACY_SERVICE}.service"
+  rm -f /etc/systemd/system/mtproto-mask-health.service
+  rm -rf "/etc/systemd/system/${MT_LEGACY_SERVICE}.service.d"
+  rm -rf "$MT_LEGACY_DIR"
+  rm -f "$MT_LEGACY_BUDDY_BIN"
+  systemctl daemon-reload
+
+  if ! mt_start_installed; then
+    return 1
+  fi
+
+  echo
+  echo -e "${GREEN}Migrated to telemt${NC}"
+  if [[ -f /etc/nginx/sites-enabled/mtproto-masking ]]; then
+    echo
+    echo -e "${YELLOW}The nginx masking site is no longer used:${NC} telemt fronts"
+    echo "unrecognised connections to ${domain} itself. Remove it with:"
+    echo "  rm /etc/nginx/sites-enabled/mtproto-masking && systemctl reload nginx"
+  fi
+  echo
+  pause
+}
+
+# Shared by a fresh install and a migration: binary, config, unit, firewall.
+mt_install_runtime() {
+  local port="$1" domain="$2" users_block="$3" version
+
+  version="$(mt_latest_version)"
+  if [[ -z "$version" ]]; then
+    echo -e "${RED}Cannot determine the latest telemt release${NC}"
+    sleep 2
+    return 1
+  fi
+
+  echo "Installing telemt ${version}..."
+  mt_ensure_user
+  if ! mt_fetch_binary "$version"; then
+    sleep 2
+    return 1
+  fi
+
+  mt_write_config "$port" "$domain" "$(mt_public_host)" "$users_block"
+  mt_write_service
+  mt_load_config
+  mt_firewall_add
+}
+
+mt_start_installed() {
+  systemctl enable "${MT_SERVICE}.service" >/dev/null 2>&1 || true
+  systemctl restart "${MT_SERVICE}.service"
+  mt_verify_service_started
 }
 
 mt_install() {
   render_header
-  echo -e "${CYAN}Installing MTProto proxy (mtproto.zig by sleep3r)...${NC}"
+  echo -e "${CYAN}Installing MTProto proxy (telemt)...${NC}"
   echo
 
-  local input_port input_tls_domain ans tmp_bootstrap
+  if mt_legacy_zig_present; then
+    mt_migrate_zig
+    return $?
+  fi
+
+  local input_port input_tls_domain ans
   read -r -p "Client port [${MT_DEFAULT_PORT}]: " input_port
   MT_PORT="${input_port:-$MT_DEFAULT_PORT}"
 
@@ -3492,51 +3799,16 @@ mt_install() {
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y curl ca-certificates xxd iptables
-
-  if ! command -v curl >/dev/null 2>&1; then
-    echo -e "${RED}curl is required${NC}"
-    sleep 2
-    return 1
-  fi
+  apt-get install -y curl ca-certificates xxd iptables tar
 
   mt_migrate_legacy
 
-  tmp_bootstrap="$(mktemp /tmp/mtproto-bootstrap.XXXXXX.sh)"
-  # The bootstrap script is fetched from a moving branch, so its fingerprint
-  # is shown and confirmed before it is executed.
-  if ! fetch_and_confirm_script "$MT_BOOTSTRAP_URL" "$tmp_bootstrap" "$MT_BOOTSTRAP_SHA256"; then
-    rm -f "$tmp_bootstrap"
-    echo -e "${RED}Bootstrap script was not confirmed; installation aborted${NC}"
-    sleep 2
-    return 1
-  fi
-  bash "$tmp_bootstrap"
-  rm -f "$tmp_bootstrap"
-
-  if [[ ! -x "$MT_BUDDY_BIN" ]]; then
-    echo -e "${RED}mtbuddy not found after bootstrap — installation failed${NC}"
-    sleep 2
+  if ! mt_install_runtime "$MT_PORT" "$MT_TLS_DOMAIN" \
+    "user = \"$(mt_random_secret)\""; then
     return 1
   fi
 
-  "$MT_BUDDY_BIN" install --port "$MT_PORT" --domain "$MT_TLS_DOMAIN" --yes
-
-  if [[ ! -d "$MT_INSTALL_DIR" ]]; then
-    echo -e "${RED}Installation failed: ${MT_INSTALL_DIR} not found${NC}"
-    sleep 2
-    return 1
-  fi
-
-  mt_firewall_add
-  systemctl daemon-reload
-  systemctl enable "${MT_SERVICE}.service" >/dev/null 2>&1
-
-  if ! mt_service_is_running; then
-    systemctl start "${MT_SERVICE}.service"
-  fi
-
-  if mt_verify_service_started; then
+  if mt_start_installed; then
     echo
     echo -e "${GREEN}MTProto proxy installed successfully${NC}"
     mt_load_config
@@ -3552,22 +3824,20 @@ mt_remove() {
   mt_require_installed || return 1
   mt_load_config
 
+  local ans
   read -r -p "Remove MTProto proxy? Type DELETE: " ans || true
   [[ "$ans" == "DELETE" ]] || return 0
 
   mt_firewall_remove
 
-  systemctl stop "${MT_SERVICE}.service" 2>/dev/null || true
-  systemctl disable "${MT_SERVICE}.service" 2>/dev/null || true
-
-  if [[ -x "$MT_BUDDY_BIN" ]]; then
-    "$MT_BUDDY_BIN" remove --yes 2>/dev/null || true
-  fi
-
+  systemctl disable --now "${MT_SERVICE}.service" 2>/dev/null || true
   rm -f "$MT_SERVICE_FILE"
-  rm -rf "$MT_INSTALL_DIR"
-  rm -f "$MT_BUDDY_BIN"
+  rm -rf "$MT_INSTALL_DIR" "$MT_STATE_DIR"
   systemctl daemon-reload
+
+  if id "$MT_RUN_USER" >/dev/null 2>&1; then
+    userdel "$MT_RUN_USER" 2>/dev/null || true
+  fi
 
   echo -e "${GREEN}MTProto proxy removed${NC}"
   sleep 2
@@ -3609,44 +3879,114 @@ mt_update() {
   mt_require_installed || return 1
   mt_load_config
 
-  if [[ ! -x "$MT_BUDDY_BIN" ]]; then
-    echo -e "${RED}mtbuddy not found; cannot update${NC}"
+  local current latest
+  current="$(mt_installed_version)"
+  latest="$(mt_latest_version)"
+
+  if [[ -z "$latest" ]]; then
+    echo -e "${RED}Cannot reach the telemt release feed${NC}"
     sleep 2
     return 1
   fi
 
-  "$MT_BUDDY_BIN" upgrade
+  echo "Installed: ${current:-unknown}"
+  echo "Latest:    ${latest}"
+  echo
 
-  systemctl restart "${MT_SERVICE}.service"
-  if mt_verify_service_started; then
-    echo -e "${GREEN}MTProto proxy updated successfully${NC}"
+  if [[ "$current" == "$latest" ]]; then
+    echo -e "${GREEN}Already up to date${NC}"
+    sleep 2
+    return 0
+  fi
+
+  if ! mt_fetch_binary "$latest"; then
+    sleep 2
+    return 1
+  fi
+
+  # The config and the unit are regenerated so an upgrade also picks up
+  # changes this manager version makes to them.
+  mt_write_config "$MT_PORT" "$MT_TLS_DOMAIN" "$(mt_public_host)" "$(mt_users_block)"
+  mt_write_service
+
+  if mt_start_installed; then
+    echo -e "${GREEN}MTProto proxy updated to ${latest}${NC}"
   fi
 
   sleep 2
 }
 
+# telemt watches its config file and reloads user changes on its own, so a
+# restart (and the data centre probe it repeats) is not needed here.
 mt_add_user() {
   render_header
   mt_require_installed || return 1
+  mt_load_config
 
-  local username
+  local username secret
   read -r -p "Username: " username
-  if [[ -z "$username" ]]; then
-    echo -e "${RED}Username cannot be empty${NC}"
+  if ! mt_valid_user_name "$username"; then
+    echo -e "${RED}Username must be 1-32 characters of A-Z, a-z, 0-9, _ or -${NC}"
     sleep 2
     return 1
   fi
 
-  if "$MT_BUDDY_BIN" user add "$username"; then
-    mt_load_config
-    echo
-    echo -e "${YELLOW}Link for ${username}:${NC} $(mt_build_link "$username")"
-  else
-    echo
-    echo "See 'mtbuddy --help' for user management commands."
+  if [[ -n "$(mt_user_secret "$username")" ]]; then
+    echo -e "${RED}User ${username} already exists${NC}"
+    sleep 2
+    return 1
   fi
 
+  secret="$(mt_random_secret)"
+  mt_write_config "$MT_PORT" "$MT_TLS_DOMAIN" "$(mt_public_host)" \
+    "$(
+      mt_users_block
+      printf '%s = "%s"\n' "$username" "$secret"
+    )"
+
+  echo
+  echo -e "${YELLOW}Link for ${username}:${NC} $(mt_build_link "$username")"
+  echo
+  pause
+}
+
+mt_remove_user() {
+  render_header
+  mt_require_installed || return 1
+  mt_load_config
+
+  local username remaining
+  read -r -p "Username to remove: " username
+  if [[ -z "$username" || -z "$(mt_user_secret "$username")" ]]; then
+    echo -e "${RED}No such proxy user${NC}"
+    sleep 2
+    return 1
+  fi
+
+  remaining="$(mt_users_block | grep -v "^${username} = ")"
+  if [[ -z "$remaining" ]]; then
+    echo -e "${RED}Refusing to remove the last proxy user${NC}"
+    echo "Remove the proxy itself instead."
+    sleep 2
+    return 1
+  fi
+
+  mt_write_config "$MT_PORT" "$MT_TLS_DOMAIN" "$(mt_public_host)" "$remaining"
+  echo -e "${GREEN}User ${username} removed; their link no longer works${NC}"
   sleep 2
+}
+
+mt_client_ips_raw() {
+  mt_load_config
+  # Peer column is "1.2.3.4:443" or "[2a00::1]:443"; strip port and brackets.
+  ss -Htn state established "( sport = :${MT_PORT} )" 2>/dev/null \
+    | awk '{print $4}' \
+    | sed -E 's/^\[//; s/\]?:[0-9]+$//' \
+    | sed '/^$/d'
+}
+
+mt_client_ip_count() {
+  mt_client_ips_raw | sort -u | wc -l
 }
 
 mt_show_active_ips() {
@@ -3681,6 +4021,7 @@ mt_show_status_link() {
   render_header
   mt_load_config
   echo -e "${YELLOW}MTProto proxy status:${NC} $(mt_service_status)"
+  echo -e "${YELLOW}Version:${NC} $(mt_installed_version)"
   echo -e "${YELLOW}Port:${NC} ${MT_PORT}"
   echo -e "${YELLOW}TLS domain:${NC} ${MT_TLS_DOMAIN} (permanent)"
   echo -e "${YELLOW}Active IPs:${NC} $(mt_client_ip_count 2>/dev/null || echo 0)"
@@ -3712,6 +4053,11 @@ mt_status_block() {
     else
       link="${proxy_users} users — see status/link"
     fi
+  elif mt_legacy_zig_present; then
+    install_status="mtproto.zig — migration pending"
+    service_status="$(systemctl is-active "${MT_LEGACY_SERVICE}.service" 2>/dev/null || echo unknown)"
+    users="0"
+    link="-"
   else
     install_status="not installed"
     service_status="-"
@@ -3719,7 +4065,7 @@ mt_status_block() {
     link="-"
   fi
 
-  # mtproto.zig by Aleksandr Kalashnikov (MIT), integrated by Nikitid
+  # telemt by Telemt (TELEMT Public License), integrated by Nikitid
   echo -e "  ${CYAN}MTProto Proxy Manager by Nikitid${NC}"
   printf '%27b\n' "${WHITE}v${SCRIPT_VERSION}${NC}"
   echo
@@ -3745,7 +4091,11 @@ mtproxy_menu() {
     mt_status_block
 
     if ! mt_is_installed; then
-      menu_item 1 "Install proxy"
+      if mt_legacy_zig_present; then
+        menu_item 1 "Migrate mtproto.zig to telemt"
+      else
+        menu_item 1 "Install proxy"
+      fi
       echo
       menu_enter_hint "Back"
       echo
@@ -3771,6 +4121,7 @@ mtproxy_menu() {
     menu_item 5 "Show active IPs"
     menu_item 6 "Show status/links"
     menu_item 7 "Show logs"
+    menu_item 8 "Remove user"
     echo
     menu_item 9 "Remove proxy"
     echo
@@ -3786,6 +4137,7 @@ mtproxy_menu() {
       5) mt_show_active_ips ;;
       6) mt_show_status_link ;;
       7) mt_show_logs ;;
+      8) mt_remove_user ;;
       9) mt_remove ;;
       "" | 0) return 0 ;;
       *) invalid_choice ;;

@@ -1,6 +1,6 @@
 # Repository map
 
-One Bash script and its tests. The map exists because that script is 4399
+One Bash script and its tests. The map exists because that script is 4753
 lines: reading it whole to change ten of them is the thing to avoid.
 
 ## The shape of it
