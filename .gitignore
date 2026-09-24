@@ -2,7 +2,6 @@
 .env
 .env.*
 *.log
-.claude/
 *.pem
 *.key
 *.crt

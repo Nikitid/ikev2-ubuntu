@@ -1,0 +1,43 @@
+name: Bug report
+description: Something does not work as documented
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        English or Russian is fine. Remove passwords, keys, public addresses
+        and private domains from everything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `ikev2-manager.sh --version`.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: Ubuntu release, server provider, client platform
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or diagnostic output
+      description: Sanitized output of `ikev2-manager.sh --check` or `--diagnostics`.
+      render: shell

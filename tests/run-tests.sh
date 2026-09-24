@@ -398,11 +398,11 @@ else
   pass
 fi
 
-# The function index is only useful while it matches the script.
-if "$TESTS_DIR/../scripts/check-index.sh" >/dev/null; then
+# Both READMEs keep the shared layout and the same sections.
+if sh "$TESTS_DIR/../scripts/check-readme.sh" >/dev/null; then
   pass
 else
-  fail "docs/INDEX.md is stale; run scripts/gen-index.sh"
+  fail "README layout: run scripts/check-readme.sh"
 fi
 
 echo

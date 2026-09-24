@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege by default; the job that publishes the release widens it.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # release-notes.sh reads the commits since the previous tag.
+          fetch-depth: 0
+
+      - name: Check the tag matches the script version
+        run: |
+          version="$(sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p' scripts/ikev2-manager.sh)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match SCRIPT_VERSION ${version}" >&2
+            exit 1
+          fi
+
+      - name: Run unit tests
+        run: bash tests/run-tests.sh
+
+      - name: Build release assets
+        run: |
+          mkdir -p dist
+          cp scripts/ikev2-manager.sh dist/
+          (cd dist && sha256sum ikev2-manager.sh > SHA256SUMS)
+          ./scripts/release-notes.sh "${GITHUB_REF_NAME}" > "${RUNNER_TEMP}/release-notes.md"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
+            dist/ikev2-manager.sh dist/SHA256SUMS
