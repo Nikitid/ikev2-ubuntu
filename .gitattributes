@@ -8,3 +8,7 @@
 *.json text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+
+# Shared scripts vendored from repo-templates: kept out of the language stats.
+scripts/check-readme.sh linguist-vendored
+scripts/release-notes.sh linguist-vendored
